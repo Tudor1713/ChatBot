@@ -9,11 +9,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from PySide6.QtWidgets import QApplication
 from desk.controller import Controller
 from desk.store import Store
+from desk.capture_service import CaptureService
 
 APP = QApplication.instance() or QApplication([])
 
 
 class ConnectionLifecycleTests(unittest.TestCase):
+    def test_switching_to_archive_stops_background_observation(self):
+        service = CaptureService(lambda *_: None)
+        service._config = {'source': 'wechat_db'}
+        service._wanted.set()
+        service._once.set()
+        epoch = service._control_epoch
+        service.configure({'source': 'archive'})
+        self.assertFalse(service._wanted.is_set())
+        self.assertFalse(service._once.is_set())
+        self.assertGreater(service._control_epoch, epoch)
+
     def setUp(self):
         for name, value in (('keychain_set', None), ('keychain_get', '{}')):
             mocked = patch('desk.platforms.' + name, return_value=value)
