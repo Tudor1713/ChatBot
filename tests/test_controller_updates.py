@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from PySide6.QtWidgets import QApplication
-from PySide6.QtTest import QTest
+from PySide6.QtTest import QSignalSpy
 from desk.controller import Controller
 APP = QApplication.instance() or QApplication([])
 
@@ -17,12 +17,13 @@ class ControllerUpdateTests(unittest.TestCase):
             controller = Controller(Path(folder))
             try:
                 events = []
+                ready = QSignalSpy(controller.stateChanged)
                 controller.toast.connect(lambda message, level: events.append(message))
                 state = {'status': 'available', 'version': '2.7.0', 'message': '合成新版本',
                          'url': 'https://github.com/Tudor1713/ChatBot/releases/tag/v2.7.0'}
                 with patch('desk.updates.check_updates', return_value=state):
                     self.assertEqual(controller.handle('check_updates', {}).result(2), state)
-                    QTest.qWait(50)
+                    self.assertTrue(ready.count() or ready.wait(2000))
                 self.assertEqual(controller.snapshot()['updates'], state)
                 controller._on_update_checked(state)
                 self.assertEqual(len(events), 1)

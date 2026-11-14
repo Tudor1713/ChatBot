@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from PySide6.QtTest import QTest
+from PySide6.QtTest import QTest, QSignalSpy
 from PySide6.QtWidgets import QApplication
 from desk.controller import Controller
 from desk.bridge import Bridge
@@ -29,11 +29,13 @@ class RuntimeOptimizationTests(unittest.TestCase):
 
     def test_burst_delivers_one_latest_snapshot(self):
         received = []
+        ready = QSignalSpy(self.ctrl.stateChanged)
         self.ctrl.stateChanged.connect(received.append)
         for i in range(100):
             self.ctrl.status['detail'] = str(i)
             self.ctrl.emit()
-        QTest.qWait(40)
+        self.assertTrue(ready.count() or ready.wait(2000))
+        QTest.qWait(40)  # The settled burst must still produce only one update.
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0]['status']['detail'], '99')
 
@@ -109,11 +111,12 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.addCleanup(first.close)
         self.addCleanup(second.close)
         received = []
+        ready = QSignalSpy(first.activated)
         first.activated.connect(lambda: received.append(True))
         self.assertTrue(first.acquire())
         self.assertTrue(first.acquire())
         self.assertFalse(second.acquire())
-        QTest.qWait(60)
+        self.assertTrue(ready.count() or ready.wait(2000))
         self.assertEqual(received, [True])
         first.close()
         self.assertTrue(second.acquire())
