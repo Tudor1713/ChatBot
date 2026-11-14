@@ -159,7 +159,11 @@ class MediaTests(unittest.TestCase):
             media.analyze_image(image_bytes(), "image/png", dict(CONFIG, media_timeout=500))
         self.assertEqual(len(transport.requests), 3)  # one metadata GET, two POST attempts
         self.assertEqual(transport.requests[0][2], 12)
-        self.assertEqual(transport.requests[-1][2], 60)
+        # Retries share a monotonic deadline; macOS measures the small elapsed
+        # time that Windows may round away. The guarantee is the upper bound.
+        self.assertEqual(transport.requests[1][2], 60)
+        self.assertGreater(transport.requests[-1][2], 0)
+        self.assertLessEqual(transport.requests[-1][2], transport.requests[1][2])
         self.assertNotIn(CONFIG["api_key"], str(error.exception))
 
     def test_failed_capability_lookup_does_not_upload_media_or_echo_remote_body(self):
