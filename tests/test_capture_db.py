@@ -1,0 +1,230 @@
+import sys
+import json
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from desk.capture_service import CaptureService
+
+
+class FakeWechatDB:
+    def __init__(self):
+        self.talker = "wxid_fake"
+        self.rows = [self._message(1, "旧消息", int(time.time()) - 20)]
+
+    @staticmethod
+    def _message(local_id, text, timestamp, side="other", kind="text"):
+        return {"id": f"fake-{local_id}", "side": side, "sender": "wxid_friend",
+                "text": text, "kind": kind, "timestamp": timestamp,
+                "source": "wechat_db", "historical": True,
+                "_cursor": (local_id, timestamp, local_id, "message_0.db|Msg_synthetic")}
+
+    def sessions(self, limit=100, offset=0, query=None):
+        return [{"id": self.talker, "name": "合成联系人", "type": "private",
+                 "source": "wechat_db", "historical": True}]
+
+    def latest_session_heads(self, limit=200, offset=0):
+        if offset:
+            return []
+        row = self.rows[-1]
+        cursor = row["_cursor"]
+        return [{"id": self.talker, "sort_timestamp": cursor[0], "timestamp": cursor[1],
+                 "last_msg_local_id": cursor[2], "last_msg_type": 1,
+                 "source": "wechat_db", "historical": True}]
+
+    def messages(self, session_id, limit=100, before=None):
+        if session_id != self.talker:
+            return []
+        return sorted(self.rows, key=lambda row: row["_cursor"], reverse=True)[:limit]
+
+    def append(self, local_id, text, timestamp=None, side="other", kind="text"):
+        self.rows.append(self._message(local_id, text, timestamp or int(time.time()), side, kind))
+
+
+class WechatDBCaptureTests(unittest.TestCase):
+    def test_empty_internal_container_is_not_selected_as_initial_conversation(self):
+        class WithContainer(FakeWechatDB):
+            def sessions(self,limit=100,offset=0,query=None):
+                return [{'id':'brandsessionholder','name':'brandsessionholder'},*super().sessions(limit,offset,query)]
+        events=[];fake=WithContainer()
+        service=CaptureService(lambda kind,data:events.append((kind,data)),db_source_factory=lambda:fake)
+        service._config={'source':'wechat_db'};service._once.set()
+        service._run_wechat_db()
+        sessions=[p['id'] for k,p in events if k=='session']
+        self.assertEqual(sessions,[fake.talker])
+        self.assertTrue(any(k=='messages' and p['session_id']==fake.talker for k,p in events))
+
+    def test_db_sender_block_records_safe_reason_without_private_exception(self):
+        with tempfile.TemporaryDirectory() as temp:
+            audit = Path(temp) / 'send-audit.jsonl'
+            service = CaptureService(lambda *_: None, audit_path=audit)
+            task = {'mode': 'send_db', 'title': 'synthetic-target',
+                    'cancelled': threading.Event(), 'done': threading.Event()}
+            service._requests.put(task)
+            with patch.object(service, '_send_db_worker',
+                              side_effect=RuntimeError('微信标题画面未更新，已拒绝发送')):
+                service._drain_requests()
+            self.assertTrue(task['done'].is_set())
+            self.assertIn('微信窗口画面没有及时更新', task['error'])
+            record = json.loads(audit.read_text(encoding='utf-8').strip())
+            self.assertEqual((record['stage'], record['status']), ('blocked', 'frame_stale'))
+            self.assertNotIn('synthetic-target', audit.read_text(encoding='utf-8'))
+
+    def test_static_window_frame_is_refreshed_before_db_send_verification(self):
+        service = CaptureService(lambda *_: None)
+        service._hwnd = 123
+        service._native_title = '微信'
+        now = time.monotonic()
+        with patch.object(service, '_frame', side_effect=[('old', now - 1.2), ('fresh', now)]) as frame, \
+             patch.object(service, '_close_capture') as close, \
+             patch.object(service, '_ensure_capture') as reopen:
+            full, at = service._fresh_db_send_frame(123, '微信')
+        self.assertEqual(full, 'fresh')
+        self.assertEqual(at, now)
+        self.assertEqual(frame.call_count, 2)
+        close.assert_called_once()
+        reopen.assert_called_once()
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows window restoration ABI')
+    def test_tray_hidden_window_is_restored_after_sender_check(self):
+        class FakeUser32:
+            visible = False
+            iconic = False
+            def EnumWindows(self, callback, value):
+                # 真机上微信 4.x 还有两个约 176x199 的隐藏 "Weixin" 工具窗，必须被排除。
+                for hwnd in (123, 456, 789):
+                    callback(hwnd, value)
+            def GetWindowRect(self, hwnd, rect):
+                size = (900, 900) if hwnd == 123 else (176, 199)
+                rect._obj.right, rect._obj.bottom = size
+            def GetForegroundWindow(self):
+                return 0
+            def IsWindow(self, _hwnd):
+                return True
+            def IsWindowVisible(self, _hwnd):
+                return self.visible
+            def IsIconic(self, _hwnd):
+                return self.iconic
+            def ShowWindow(self, _hwnd, command):
+                self.visible = command != 0
+                return True
+
+        user32 = FakeUser32()
+        service = CaptureService(lambda *_: None)
+        with patch("app.winapi.libraries", return_value=(user32, None, None)), \
+             patch("app.winapi.process_name", return_value="weixin.exe"), \
+             patch("app.winapi.window_title", return_value="微信"):
+            with service._temporary_db_send_window() as hwnd:
+                self.assertEqual(hwnd, 123)
+                self.assertTrue(user32.visible)
+            self.assertFalse(user32.visible)
+
+    def test_db_sender_rejects_outgoing_head_before_any_capture(self):
+        fake = FakeWechatDB()
+        fake.rows[-1]["side"] = "me"
+        service = CaptureService(lambda *_: None, db_source_factory=lambda: fake)
+        service._config = {"source": "wechat_db"}
+        task = {"text": "合成回复（以上内容为ChatBot生成）", "session_id": fake.talker,
+                "message_id": fake.rows[-1]["id"], "title": fake.talker,
+                "cancelled": threading.Event(), "epoch": service._control_epoch}
+        with patch.object(service, "_ensure_capture", side_effect=AssertionError("No screen read permitted")):
+            with self.assertRaisesRegex(RuntimeError, "已有更新"):
+                service._send_db_visible_worker(task, expected_hwnd=0)
+
+    def test_db_source_emits_initial_history_then_only_recent_new_inbound_text_live(self):
+        fake = FakeWechatDB()
+        events = []
+        ready = threading.Event()
+
+        def callback(kind, payload):
+            events.append((kind, payload))
+            if kind == "status" and payload.get("capture") == "live":
+                ready.set()
+
+        service = CaptureService(callback, db_source_factory=lambda: fake)
+        with patch.object(service, "_ensure_capture", side_effect=AssertionError("OCR/WGC must not start")), \
+             patch.object(service, "_read_frame", side_effect=AssertionError("OCR must not read chats")):
+            service.start({"source": "wechat_db", "db_poll_seconds": .25})
+            self.assertTrue(ready.wait(2))
+            deadline = time.monotonic() + 2
+            while not any(kind == "messages" for kind, _ in events) and time.monotonic() < deadline:
+                time.sleep(.01)
+            initial = [payload for kind, payload in events if kind == "messages"]
+            self.assertEqual(len(initial), 1)
+            self.assertTrue(initial[0]["historical"])
+            self.assertTrue(all(message["historical"] for message in initial[0]["messages"]))
+
+            fake.append(2, "新的具体问题")
+            deadline = time.monotonic() + 3
+            while not any(kind == "messages" and not payload["historical"] for kind, payload in events) \
+                    and time.monotonic() < deadline:
+                time.sleep(.01)
+            live = [payload for kind, payload in events if kind == "messages" and not payload["historical"]]
+            self.assertEqual(len(live), 1)
+            self.assertEqual(live[0]["messages"][0]["text"], "新的具体问题")
+            self.assertEqual(live[0]["messages"][0]["side"], "other")
+            self.assertEqual(live[0]["messages"][0]["kind"], "text")
+
+            fake.append(3, "旧语音", int(time.time()) - 301, kind="voice")
+            deadline = time.monotonic() + 3
+            while len([1 for kind, payload in events if kind == "messages" and payload["messages"]
+                       and payload["messages"][0]["id"] == "fake-3"]) == 0 and time.monotonic() < deadline:
+                time.sleep(.01)
+            stale = [payload for kind, payload in events if kind == "messages" and payload["messages"]
+                     and payload["messages"][0]["id"] == "fake-3"]
+            self.assertEqual(len(stale), 1)
+            self.assertTrue(stale[0]["historical"])
+            service.stop()
+
+    def test_unknown_or_duplicate_head_never_emits_live_message(self):
+        fake = FakeWechatDB()
+        events = []
+        service = CaptureService(lambda kind, payload: events.append((kind, payload)),
+                                 db_source_factory=lambda: fake)
+        with patch.object(service, "_ensure_capture", side_effect=AssertionError("OCR/WGC must not start")):
+            service.start({"source": "wechat_db", "db_poll_seconds": .25})
+            deadline = time.monotonic() + 2
+            while not any(kind == "status" and payload.get("capture") == "live" for kind, payload in events) \
+                    and time.monotonic() < deadline:
+                time.sleep(.01)
+            fake.append(2, "只应出现一次")
+            deadline = time.monotonic() + 2
+            while not any(kind == "messages" and not payload["historical"] for kind, payload in events) \
+                    and time.monotonic() < deadline:
+                time.sleep(.01)
+            count = sum(1 for kind, payload in events if kind == "messages" and payload["messages"]
+                        and payload["messages"][0]["id"] == "fake-2")
+            self.assertEqual(count, 1)
+            service.stop()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class SendTargetTitleTests(unittest.TestCase):
+    """真机发现：OCR 会漏识别生僻字（"陈铄果" → "陈果"）。"""
+
+    def test_ocr_dropped_character_matches_only_when_target_is_unique_best(self):
+        from desk.capture_service import title_matches
+        self.assertTrue(title_matches("陈果", "陈铄果", ["陈铄果", "合成联系人"]))
+        # 另有会话恰好叫"陈果"时，目标不再是唯一最佳匹配，必须拒发。
+        self.assertFalse(title_matches("陈果", "陈铄果", ["陈铄果", "陈果"]))
+        self.assertFalse(title_matches("合成联系人", "陈铄果", ["陈铄果", "合成联系人"]))
+        self.assertTrue(title_matches("合成群(12)", "合成群", ["合成群"]))
+
+
+class SendCapabilityTests(unittest.TestCase):
+    def test_real_capture_service_reports_send_capability_by_platform(self):
+        # 后端以真实采集服务的能力为准：macOS 必须拒绝自动发送，Windows 允许。
+        import desk.platforms as platforms
+        real = platforms.capabilities
+        service = CaptureService(lambda *_: None)
+        with patch.object(platforms, "capabilities", lambda platform=None: real("darwin")):
+            self.assertFalse(service.supports_send)
+        with patch.object(platforms, "capabilities", lambda platform=None: real("win32")):
+            self.assertTrue(service.supports_send)

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="ChatBot，在微信对话中理解语境、判断意图，并斟酌每一次回应。">
+  <meta name="color-scheme" content="light">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' qrc:; script-src 'self' qrc:; style-src 'self'; img-src 'self' data:; media-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>ChatBot</title>
+  <link rel="icon" href="mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="legacy.css">
+  <link rel="stylesheet" href="paper.css">
+  <link rel="stylesheet" href="minimal.css">
+  <script src="qrc:///qtwebchannel/qwebchannel.js" defer></script>
+  <script src="experience.js" defer></script>
+  <script src="workbench.js" defer></script>
+  <script src="relationships.js" defer></script>
+  <script src="timeline.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <img id="scene-background" class="scene-background" alt="" hidden>
+  <a class="skip-link" href="#main">跳到工作区</a>
+  <div id="app" class="app-shell">
+    <header id="titlebar" class="titlebar">
+      <a class="brand" href="#workspace" aria-label="ChatBot"><img src="mark.svg" alt="" width="22" height="22"><span class="brand-type">ChatBot</span></a>
+      <span id="demo-label" class="demo-label" hidden>演示数据</span>
+      <div class="titlebar-space" aria-hidden="true"></div>
+      <div class="titlebar-actions">
+        <button id="auto-reply-pill" class="tb-pill tb-auto" type="button" hidden></button>
+        <button id="status-toggle" class="tb-pill tb-status" type="button"></button>
+        <span class="tb-divider" aria-hidden="true"></span>
+        <button id="compact-button" class="tb-icon" type="button" title="悬浮小窗" aria-label="悬浮小窗"></button>
+        <button id="settings-button" class="tb-icon" type="button" title="设置（Ctrl+,）" aria-label="设置"></button>
+      </div>
+      <div id="window-controls" class="window-controls" hidden>
+        <button type="button" data-window="minimize" title="最小化" aria-label="最小化"></button>
+        <button type="button" data-window="maximize" title="最大化" aria-label="最大化"></button>
+        <button type="button" data-window="close" class="window-close" title="关闭" aria-label="关闭"></button>
+      </div>
+    </header>
+    <div id="offline-notice" class="notice notice-warn" hidden></div>
+    <main id="main" tabindex="-1"><div class="startup"><img src="mark.svg" width="48" height="48" alt=""><p>正在打开 ChatBot</p><div class="startup-line"></div></div></main>
+  </div>
+  <div id="drawer-scrim" class="drawer-scrim" hidden></div>
+  <aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-label="设置" aria-hidden="true" hidden></aside>
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+  <dialog id="editor" class="dialog"></dialog>
+  <dialog id="session-catalog" class="dialog catalog-dialog" aria-label="选择会话"></dialog>
+</body>
+</html>

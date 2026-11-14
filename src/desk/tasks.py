@@ -1,0 +1,161 @@
+"""Cancelable model processes and daemon-only native helper tasks."""
+import multiprocessing
+import threading
+from concurrent.futures import Future
+from core.model_profile import profile_for
+
+
+def _model_job(pipe, kind, payload):
+    try:
+        from core.engine import analyze, test_connection
+        if kind == 'test_connection':
+            result = test_connection(payload)
+        elif kind == 'analyze':
+            result = analyze(**payload)
+        elif kind == 'analyze_image':
+            from core.media import analyze_image
+            result = analyze_image(**payload)
+        elif kind == 'transcribe_audio':
+            from core.media import transcribe_audio
+            result = transcribe_audio(**payload)
+        elif kind == 'analyze_moment':
+            from core.moments import analyze_post
+            result = analyze_post(**payload)
+        elif kind == 'judge_backlog':
+            from core.backlog import evaluate_backlog
+            result = evaluate_backlog(**payload)
+        elif kind == 'learn_style':
+            from core.style import learn_style
+            result = learn_style(**payload)
+        elif kind == 'run_agent':
+            from core.agent import run_agent
+            result = run_agent(**payload)
+        elif kind == 'extract_followups':
+            from core.followups import extract_followups
+            result = extract_followups(**payload)
+        elif kind == 'analyze_history':
+            from core.relationships import analyze_history
+            result = analyze_history(**payload)
+        elif kind == 'chat_persona':
+            from core.relationships import chat_persona
+            result = chat_persona(**payload)
+        elif kind == 'work_turn':
+            from core.work_agent import run_work_turn
+            result = run_work_turn(**payload)
+        else:
+            raise ValueError('未识别的模型任务。')
+        pipe.send((True, result))
+    except Exception as exc:
+        config = payload if kind == 'test_connection' else payload.get('config', {})
+        error = str(exc) or '模型任务未完成。'
+        for name in ('api_key', 'reply_api_key', 'weflow_token', 'vision_api_key', 'stt_api_key', 'work_api_key'):
+            value = config.get(name)
+            if value:
+                error = error.replace(value, '[已隐藏]')
+        pipe.send((False, error[:1200]))
+    finally:
+        pipe.close()
+
+
+class ModelTasks:
+    def __init__(self):
+        self.context = multiprocessing.get_context('spawn')
+        self.lock = threading.RLock()
+        self.jobs = {}
+        self.closed = False
+
+    def submit(self, kind, payload):
+        with self.lock:
+            if self.closed:
+                raise RuntimeError('应用正在关闭。')
+            # 回复链路（判断/分析）预留 2 个额外槽位，避免被 Work Agent、洞察等长任务挤掉。
+            if len(self.jobs) >= (5 if kind in ('judge_backlog', 'analyze') else 3):
+                raise RuntimeError('已有模型任务正在运行，请稍后再试。')
+            recv, send = self.context.Pipe(duplex=False)
+            future = Future()
+            process = self.context.Process(target=_model_job, args=(send, kind, payload), daemon=True)
+            try:
+                process.start()
+            except BaseException:
+                recv.close()
+                send.close()
+                process.close()
+                raise
+            send.close()
+            self.jobs[id(future)] = (process, recv, future)
+        def watch():
+            try:
+                config=payload.get('config',{})
+                budget=300 if kind=='analyze' and profile_for(config.get('model_name')) else 180
+                if not recv.poll(900 if kind == 'work_turn' else budget):
+                    process.terminate()
+                    raise RuntimeError('模型任务超时，请检查网络与服务状态。')
+                success, value = recv.recv()
+                if not future.done():
+                    future.set_result(value) if success else future.set_exception(RuntimeError(value))
+            except (EOFError, OSError):
+                if not future.done():
+                    future.set_exception(RuntimeError('模型任务已停止。'))
+            except Exception as exc:
+                if not future.done():
+                    future.set_exception(exc)
+            finally:
+                recv.close()
+                process.join(timeout=1)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=.5)
+                with self.lock:
+                    self.jobs.pop(id(future), None)
+        threading.Thread(target=watch, name='chatbot-model-result', daemon=True).start()
+        return future
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            jobs = list(self.jobs.values())
+            for process, recv, future in jobs:
+                future.cancel()
+                if process.is_alive():
+                    process.terminate()
+            self.jobs.clear()
+        for process, _, _ in jobs:
+            process.join(timeout=.5)
+
+    def cancel(self, future):
+        """Stop one isolated model job without cancelling unrelated requests."""
+        with self.lock:
+            job = self.jobs.get(id(future))
+            if not job:
+                return False
+            process, _, owned = job
+            if not owned.done():
+                owned.cancel()
+            if process.is_alive():
+                process.terminate()
+            return True
+
+
+class HelperTasks:
+    def __init__(self):
+        self.closed = False
+        self.slots = threading.BoundedSemaphore(6)
+
+    def submit(self, fn, *args):
+        if self.closed or not self.slots.acquire(blocking=False):
+            raise RuntimeError('正在处理上一个操作，请稍后再试。')
+        future = Future()
+        def work():
+            try:
+                if future.set_running_or_notify_cancel():
+                    future.set_result(fn(*args))
+            except Exception as exc:
+                if not future.done():
+                    future.set_exception(exc)
+            finally:
+                self.slots.release()
+        threading.Thread(target=work, name='chatbot-native-helper', daemon=True).start()
+        return future
+
+    def close(self):
+        self.closed = True

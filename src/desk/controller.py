@@ -1,0 +1,2942 @@
+"""Application orchestration. All session mutations run on the Qt application thread."""
+from __future__ import annotations
+
+import copy
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import threading
+import time
+import uuid
+from collections import OrderedDict, deque
+from pathlib import Path
+
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import QApplication, QFileDialog
+
+from .store import Store, _atomic, _load, normalize_title
+from .work_agent_store import WorkAgentStore
+from .auto_reply import AutoReplyGuard
+from .imports import ChatLabImporter
+from .datahub import DataHub
+from .wechat_db_source import WeChatDBSource
+from .wechat_sqlcipher import discover_cipher_source
+from .week_history import read_week_context
+from core.week_context import select_week, timestamp
+from core.model_profile import profile_for
+from .version import VERSION
+from .tasks import ModelTasks, HelperTasks
+from .platforms import capabilities
+from .actions import ActionStore
+from .relationships import RelationshipStore
+from .memory import MemoryStore, SELF as MEMORY_SELF
+from .reply_history import ReplyHistory
+from .session_profiles import SessionProfiles
+from .stickers import DESCRIBE_PROMPT, StickerNotes, fetch_sticker
+from core.style import style_prompt
+
+AUTO_DISCLOSURE = '（以上内容为ChatBot生成）'
+# backlog.prefilter 的拒绝原因 → 自动回复记录里的可读说明
+SKIP_REASONS = {
+    'self_is_last_message': '最后一条已是我发出的消息',
+    'no_prior_self_message': '会话里还没有我发过的消息',
+    'group_not_explicitly_directed': '群消息没有 @我（当前为仅 @我 模式）',
+    'stale_over_7_days': '消息超过 7 天',
+    'future_timestamp': '消息时间异常',
+    'candidate_not_latest_context': '目标消息已不是最新一轮',
+    'ambiguous_model_judgment': '模型判断把握不足',
+    'jev_typed_decision': '模型判断这条消息无需回复',
+}
+
+
+class Controller(QObject):
+    stateChanged = Signal(dict)
+    toast = Signal(str, str)
+    captureEvent = Signal(str, dict)
+    analysisDone = Signal(str, int, str, object, object)
+    windowAction = Signal(str, object)
+    dataEvent = Signal(str, object)
+    sessionLoaded = Signal(str, object, object)
+    importFinished = Signal(object, object)
+    mediaFinished = Signal(str, str, object, object)
+    autoSendFinished = Signal(str, object, object)
+    catchUpPrepared = Signal(int, str, str, object, object)
+    catchUpSent = Signal(int, str, object, object)
+    workAgentProgress = Signal(str, str)
+    stickerDescribed = Signal(str, object, object)
+    updateChecked = Signal(object)
+
+    def __init__(self, directory: Path):
+        super().__init__()
+        from .capture_service import CaptureService
+        self.store = Store(directory)
+        self.work_agent = WorkAgentStore(Path(directory) / 'work-agent')
+        self.work_agent_busy = set()
+        self.work_agent_jobs = {}
+        self.work_agent_cancelled = set()
+        self.work_agent_phases = {}
+        self.work_agent_lock = threading.RLock()
+        self.imports = ChatLabImporter(directory)
+        self.relationships = RelationshipStore(self.imports)
+        self.actions = ActionStore(directory)
+        self.speech = None
+        self.hub = DataHub(on_update=lambda kind, data: self.dataEvent.emit(kind, data))
+        self.capture = CaptureService(lambda k, p: self.captureEvent.emit(k, p),
+                                      Path(directory) / 'send-audit.jsonl')
+        self.capture.configure(self.store.full_config())
+        self.pool = HelperTasks()
+        self.models = ModelTasks()
+        self.update_state = {'status': 'idle', 'message': '可检查新版本。'}
+        self.update_busy = False
+        self.update_notified = None
+        self.updateChecked.connect(self._on_update_checked)
+        self.sessions = {s['id']: s for s in self.store.load_history() if isinstance(s, dict) and s.get('id')}
+        self.results, self.result_fingerprints = {}, {}
+        self.current_id = next(iter(self.sessions), None)
+        self.live_id = None
+        self.follow_live = True
+        self.catalog = {'source': 'local', 'scope': 'collected_only', 'available': bool(self.imports.count()),
+                        'loaded': len(self.sessions), 'imported': self.imports.count(), 'preview_updates': []}
+        self.catalog_cursors = OrderedDict()
+        self.catalog_lock = threading.RLock()
+        self.catalog_items = OrderedDict()
+        self.moments = {'items': [], 'available': False, 'source': 'local', 'warning': '尚无朋友圈数据源'}
+        self.manual_moments = OrderedDict()
+        self.moment_posts = OrderedDict()
+        self.media_cache = OrderedDict()
+        self.media_inputs = OrderedDict()
+        self.memory = MemoryStore(directory)
+        self.reply_history = ReplyHistory(directory)
+        self.profiles = SessionProfiles(directory)
+        self.style_file = Path(directory) / 'my-style.json'
+        style = _load(self.style_file, {})
+        self.my_style = style if isinstance(style, dict) and style.get('profile') else {}
+        self.style_busy = False
+        self.analysis_due = {}  # 会话 → 到点自动分析的时间（epoch 秒）
+        self.regen_requests = {}  # 会话 → 「换一批」的要求、上一批回复、可沿用的判断
+        self.sticker_notes = StickerNotes(directory)
+        self.sticker_sources = OrderedDict()   # md5 -> 下载信息（只在内存）
+        self.sticker_bytes = OrderedDict()     # md5 -> (bytes, mime)，最近用过的表情图
+        self.sticker_queue = deque()
+        self.sticker_busy = None
+        self.sticker_failed = set()
+        self.auto_last_reply = None
+        self.background_url = self._background_url()
+        self.status = {'capture': 'idle', 'analysis': 'idle', 'detail': '配置接口后，开始读取微信本机数据库。',
+                       'last_error': self.store.error, 'source': self.store.config['source'], 'connected': False}
+        self.revision, self.job_serial = 0, 0
+        self.inflight = None
+        self.pending = None
+        self.pending_manual = False
+        self.auto_file = self.store.directory / 'auto-reply.json'
+        saved_auto = _load(self.auto_file, {})
+        saved_auto = saved_auto if isinstance(saved_auto, dict) else {}
+        guard_state = saved_auto.get('guard')
+        self.auto_integrity_error = self.auto_file.exists() and not (
+            saved_auto.get('version') == 1 and isinstance(guard_state, dict) and
+            isinstance(guard_state.get('seen'), list) and isinstance(guard_state.get('sent'), list) and
+            isinstance(saved_auto.get('allowlist'), list))
+        try:
+            self.auto_guard = AutoReplyGuard(guard_state)
+        except (TypeError, ValueError):
+            self.auto_integrity_error = True
+            self.auto_guard = AutoReplyGuard()
+        self.auto_policy = self._auto_policy_from(saved_auto.get('policy'))
+        self.auto_policy['enabled'] = False  # 启动时不直接武装；仅在用户选了「重启后自动恢复」时走完整检查后恢复。
+        self.auto_resume = bool((saved_auto.get('policy') or {}).get('resume')) if isinstance(saved_auto.get('policy'), dict) else False
+        self.auto_resume_on_launch = self.auto_resume and not self.auto_integrity_error
+        self.auto_allowlist = [entry for entry in (saved_auto.get('allowlist') or [])
+                               if isinstance(entry, dict) and entry.get('session_id') and entry.get('type') in ('private', 'group')][:50]
+        self.auto_paused = False
+        self.auto_failures = 0  # 连续发送失败次数，达到 3 才暂停
+        self.auto_detail = ('自动回复状态文件无法可靠读取；请重新保存名单并重启应用后再启用。'
+                            if self.auto_integrity_error else
+                            '默认关闭。选择会话并明确启用后，只回复新收到的消息。')
+        self.auto_recent = []
+        self.auto_trigger = None
+        self.auto_running_trigger = None
+        self.auto_epoch = 0
+        self.auto_send_busy = False
+        self.auto_deferred = None
+        self.catchup = {'session_id': None, 'status': 'idle', 'reason': ''}
+        self.catchup_serial = 0
+        self.catchup_busy = False
+        self.closed = False
+        self.state_timer = QTimer(self)
+        self.state_timer.setSingleShot(True)
+        self.state_timer.setInterval(16)
+        self.state_timer.timeout.connect(self._publish_state)
+        self.allow_initial = False
+        self.paused_by_user = False
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self._run_pending)
+        self.due_timer = QTimer(self)  # 只在有排队的自动分析时运行
+        self.due_timer.setInterval(1000)
+        self.due_timer.timeout.connect(self._check_due_analysis)
+        self.captureEvent.connect(self._on_capture)
+        self.analysisDone.connect(self._on_analysis)
+        self.dataEvent.connect(self._on_data)
+        self.sessionLoaded.connect(self._on_session_loaded)
+        self.importFinished.connect(self._on_import_finished)
+        self.mediaFinished.connect(self._on_media_finished)
+        self.autoSendFinished.connect(self._on_auto_sent)
+        self.catchUpPrepared.connect(self._on_catchup_prepared)
+        self.catchUpSent.connect(self._on_catchup_sent)
+        self.stickerDescribed.connect(self._on_sticker_described)
+        if self.auto_resume_on_launch:
+            QTimer.singleShot(6000, self._resume_auto_after_launch)
+        self._sync_hub()
+        if self.store.config['source'] in ('weflow', 'auto') and self.store.secrets['weflow_token']:
+            self.hub.prewarm(self.store.full_config(), limit=5)
+
+    def _background_url(self):
+        target = self.store.directory / 'background.jpg'
+        if not target.is_file() or target.stat().st_size > 1024 * 1024:
+            return ''
+        return 'data:image/jpeg;base64,' + base64.b64encode(target.read_bytes()).decode('ascii')
+
+    def _appearance(self):
+        return {'theme': self.store.config['theme'], 'font_scale': self.store.config['font_scale'],
+                'background_url': self.background_url,
+                **{k: self.store.config[k] for k in ('motion', 'intro_enabled', 'background_dim')}}
+
+    @staticmethod
+    def _auto_policy_from(value):
+        data = value if isinstance(value, dict) else {}
+        def bounded(name, default, minimum, maximum):
+            try:
+                return min(maximum, max(minimum, int(data.get(name, default))))
+            except (TypeError, ValueError):
+                return default
+        return {'enabled': False, 'session_ids': [],
+                'group_mode': data.get('group_mode') if data.get('group_mode') in ('mention_only', 'all') else 'mention_only',
+                'debounce_seconds': bounded('debounce_seconds', 3, 2, 15),
+                'cooldown_seconds': bounded('cooldown_seconds', 60, 15, 3600),
+                'hourly_limit': bounded('hourly_limit', 10, 1, 30),
+                'daily_limit': bounded('daily_limit', 30, 1, 100),
+                # 先给我留时间自己回：这段时间里我回了，就不自动回。上限受「5 分钟内发出」的时效约束。
+                'wait_me_seconds': bounded('wait_me_seconds', 0, 0, 180)}
+
+    def _auto_public(self):
+        now = time.time()
+        sent = self.auto_guard.snapshot().get('sent', [])
+        enabled = self.auto_policy['enabled']
+        visible_allowed = (any(item.get('source') == 'wechat_db' for item in self.auto_allowlist)
+                           if self.store.config['source'] == 'wechat_db' else
+                           any(item['session_id'] == self.live_id for item in self.auto_allowlist))
+        waiting_for_target = enabled and not self.auto_paused and self.status['capture'] == 'live' and not visible_allowed
+        status = ('off' if not enabled else 'paused' if self.auto_paused else
+                  'running' if self.status['capture'] == 'live' and visible_allowed else 'blocked')
+        detail = ('微信当前显示的会话不在自动回复名单中；请切回允许会话并保持聊天尾部可见。'
+                  if waiting_for_target else self.auto_detail)
+        return {'enabled': enabled, 'paused': self.auto_paused, 'status': status,
+                'detail': detail, 'waiting_for_target': waiting_for_target,
+                'allowlist': copy.deepcopy(self.auto_allowlist),
+                'group_mode': self.auto_policy['group_mode'],
+                'debounce_seconds': self.auto_policy['debounce_seconds'],
+                'cooldown_seconds': self.auto_policy['cooldown_seconds'],
+                'hourly_limit': self.auto_policy['hourly_limit'],
+                'daily_limit': self.auto_policy['daily_limit'],
+                'wait_me_seconds': self.auto_policy['wait_me_seconds'],
+                'resume': self.auto_resume,
+                'sent_hour': sum(1 for item in sent if now - item['at'] < 3600),
+                'sent_day': sum(1 for item in sent if now - item['at'] < 86400),
+                'recent': copy.deepcopy(self.auto_recent[-12:]),
+                'catchup': copy.deepcopy(self.catchup)}
+
+    def _save_auto_state(self):
+        # The sender itself is never stored as armed. Only when the user ticked
+        # 「重启后自动恢复」 while it was running does the next launch re-run the
+        # same start checks. No message text is stored here.
+        stored = {**self.auto_policy, 'enabled': False,
+                  'resume': bool(self.auto_resume and self.auto_policy['enabled'] and not self.auto_paused)}
+        stored['session_ids'] = []
+        guard = self.auto_guard.snapshot()
+        guard['pending'] = {}
+        _atomic(self.auto_file, {'version': 1, 'policy': stored,
+                                  'allowlist': self.auto_allowlist, 'guard': guard})
+
+    def _auto_log(self, sid, status, reason):
+        """排查用：只记会话的散列、状态和固定原因，不记会话名或消息内容。"""
+        line = json.dumps({'at': round(time.time(), 1), 'session': hashlib.sha256(str(sid).encode()).hexdigest()[:12],
+                           'status': status, 'reason': str(reason)[:160]}, ensure_ascii=False)
+        path = self.store.directory / 'auto-events.jsonl'
+        try:
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write(line + '\n')
+            if path.stat().st_size > 256 * 1024:
+                lines = path.read_text(encoding='utf-8').splitlines()[-800:]
+                path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        except OSError:
+            pass
+
+    def _auto_record(self, sid, status, reason):
+        session = self.sessions.get(sid) or {}
+        chosen = next((item for item in self.auto_allowlist if item['session_id'] == sid), {})
+        self.auto_recent.append({'id': uuid.uuid4().hex, 'title': str(session.get('title') or chosen.get('title') or '会话')[:100],
+                                 'is_group': chosen.get('type') == 'group', 'at': time.time(),
+                                 'status': status, 'reason': str(reason)[:160]})
+        self.auto_recent = self.auto_recent[-20:]
+        self._auto_log(sid, status, reason)
+
+    def _resume_auto_after_launch(self):
+        """上次开着自动回复且勾了「重启后自动恢复」：走与手动开启完全相同的检查后恢复。"""
+        if self.closed or not self.auto_resume_on_launch or self.auto_policy['enabled']:
+            return
+        self.auto_resume_on_launch = False
+        try:
+            self.auto_resume = True
+            self._start_auto({'acknowledge_send': True, 'remember': True})
+            self.auto_detail = '已按上次的设置自动恢复自动回复。' + self.auto_detail
+            self._auto_log('', 'resumed', '启动后自动恢复')
+            self.toast.emit(f'自动回复已恢复（{len(self.auto_allowlist)} 个会话）', 'info')
+        except Exception as exc:
+            self.auto_detail = '上次开着的自动回复没能自动恢复：' + self.safe_error(exc)
+            self._auto_log('', 'resume_failed', self.safe_error(exc)[:120])
+            self.toast.emit(self.auto_detail, 'error')
+        self.emit()
+
+    def _cancel_auto_work(self):
+        self.auto_epoch += 1
+        self.auto_trigger = None
+        self.auto_running_trigger = None
+        self.auto_deferred = None
+        if self.catchup_busy:
+            self.catchup_serial += 1
+            self.catchup_busy = False
+            self.catchup = {**self.catchup, 'status': 'skipped', 'reason': '一次性历史补回已停止。'}
+        if hasattr(self.capture, 'cancel_pending_writes'):
+            self.capture.cancel_pending_writes()
+
+    def _configure_auto(self, params):
+        entries = params.get('allowlist')
+        if not isinstance(entries, list) or len(entries) > 50:
+            raise ValueError('请从会话目录选择不超过 50 个联系人或群聊。')
+        resolved, seen = [], set()
+        for raw in entries:
+            if not isinstance(raw, dict):
+                raise ValueError('自动回复会话配置无效。')
+            sid = str(raw.get('session_id') or '')[:256]
+            if not sid:
+                continue
+            legacy = next((item for item in self.auto_allowlist if item['session_id'] == sid
+                           and item.get('source') == 'ocr'), None)
+            if legacy and self.store.config['source'] == 'wechat_db':
+                meta = self._migrate_ocr_auto_target(legacy)
+                sid = meta['id']
+            else:
+                with self.catalog_lock:
+                    meta = copy.deepcopy(self.catalog_items.get(sid))
+                meta = meta or copy.deepcopy(self.sessions.get(sid))
+                saved = next((item for item in self.auto_allowlist if item['session_id'] == sid
+                              and item.get('source') == 'wechat_db'), None)
+                if not meta and saved and self.store.config['source'] == 'wechat_db':
+                    meta = self._verify_saved_db_auto_target(saved)
+            if sid in seen:
+                continue
+            if not meta or meta.get('source') not in ('ocr', 'weflow', 'wechat_db'):
+                raise ValueError('自动回复只能选择实时微信会话，不能选择导入归档。')
+            if meta.get('source') == 'ocr' and (sid != self.live_id or self.status['capture'] != 'live'):
+                raise ValueError('OCR 自动回复只能选择当前微信正在显示的会话。')
+            if meta.get('source') in ('weflow', 'wechat_db'):
+                talker = str(meta.get('talker') or meta.get('id') or '')
+                kind = 'group' if talker.endswith('@chatroom') else meta.get('type')
+                if kind not in ('private', 'group'):
+                    raise ValueError('数据库或 WeFlow 未提供可靠的会话类型，已拒绝自动发送。')
+            else:
+                kind = raw.get('type')
+                if kind not in ('private', 'group'):
+                    raise ValueError('请明确确认当前 OCR 会话是单聊还是群聊。')
+            resolved.append({'session_id': sid, 'title': str(meta.get('title') or '')[:200],
+                             'type': kind, 'is_group': kind == 'group', 'source': meta['source']})
+            seen.add(sid)
+        if len({entry['source'] for entry in resolved}) > 1:
+            raise ValueError('自动回复一次只能使用一种实时消息来源，不能混合名单。')
+        self._cancel_auto_work()
+        self.auto_allowlist = resolved
+        self.auto_policy = self._auto_policy_from(params)
+        self.auto_policy['session_ids'] = [entry['session_id'] for entry in resolved]
+        self.auto_paused = False
+        self.auto_detail = '配置已保存，默认关闭；启用后会向微信当前可核验的会话直接发送回复。'
+        try:
+            self._save_auto_state()
+        except OSError:
+            self.auto_policy['enabled'] = False
+            self.auto_detail = '无法保存自动回复状态，已拒绝启动。'
+            raise
+        self.emit()
+        return self._auto_public()
+
+    def _migrate_ocr_auto_target(self, legacy):
+        """Upgrade one old title-only OCR allowlist entry to a unique DB ID."""
+        title = str(legacy.get('title') or '').strip()
+        expected_type = legacy.get('type')
+        if not title or expected_type not in ('private', 'group'):
+            raise ValueError('旧 OCR 名单缺少会话名称或类型，请从数据库会话目录重新选择。')
+        try:
+            source = self._wechat_db_reader()
+            matches, offset = [], 0
+            while offset < 100000:
+                page = source.sessions(limit=500, offset=offset)
+                matches.extend(item for item in page
+                               if item.get('type') == expected_type
+                               and normalize_title(item.get('name')) == normalize_title(title))
+                if len(matches) > 1:
+                    break
+                offset += len(page)
+                if len(page) < 500:
+                    break
+        except Exception:
+            raise ValueError('无法核验旧 OCR 名单，请从数据库会话目录重新选择。') from None
+        if len(matches) != 1:
+            raise ValueError('旧 OCR 名单无法唯一对应数据库会话，请从数据库会话目录重新选择。')
+        item = matches[0]
+        migrated = {'id': item['id'], 'title': item.get('name') or title,
+                    'type': expected_type, 'source': 'wechat_db', 'talker': item['id']}
+        self._remember_catalog([migrated])
+        return migrated
+
+    def _verify_saved_db_auto_target(self, saved):
+        """Resolve a persisted DB allowlist ID after a fresh app launch."""
+        ident = str(saved.get('session_id') or '')
+        expected_type = saved.get('type')
+        if not ident or expected_type not in ('private', 'group'):
+            raise ValueError('数据库自动回复名单无效，请重新选择会话。')
+        try:
+            source = self._wechat_db_reader()
+            matches, offset = [], 0
+            while offset < 100000:
+                page = source.sessions(limit=500, offset=offset)
+                matches.extend(item for item in page if item.get('id') == ident)
+                offset += len(page)
+                if len(page) < 500:
+                    break
+        except Exception:
+            raise ValueError('无法核验数据库自动回复名单，请重新选择会话。') from None
+        if len(matches) != 1 or matches[0].get('type') != expected_type:
+            raise ValueError('数据库自动回复名单已过期，请重新选择会话。')
+        item = matches[0]
+        meta = {'id': ident, 'title': item.get('name') or ident,
+                'type': expected_type, 'source': 'wechat_db', 'talker': ident}
+        self._remember_catalog([meta])
+        return meta
+
+    def _start_auto(self, params):
+        if self.auto_integrity_error:
+            raise ValueError('自动回复去重或限额状态损坏；请重新保存名单并重启应用后再启用。')
+        if params.get('acknowledge_send') is not True:
+            raise ValueError('请确认：自动回复会真正发送给所选微信联系人或群聊。')
+        if 'remember' in params:
+            self.auto_resume = bool(params.get('remember'))
+        if not getattr(self.capture, 'supports_send', True):
+            # 平台限制必须在后端兜底，不能只靠前端隐藏入口；能力由真实采集服务按平台给出。
+            raise ValueError('当前平台暂不支持自动发送微信消息；可使用实时读取、分析与候选回复。')
+        if not self.auto_allowlist:
+            raise ValueError('请先选择允许自动回复的实时会话。')
+        if not self.store.secrets['api_key']:
+            raise ValueError('请先配置模型 API Key。')
+        source = self.auto_allowlist[0].get('source')
+        if source == 'weflow' and self.store.config['source'] != 'weflow':
+            raise ValueError('请先在设置中启用已连接的 WeFlow 消息来源。')
+        if source == 'wechat_db' and self.store.config['source'] != 'wechat_db':
+            raise ValueError('请先在设置中启用本机微信数据库来源。')
+        if source == 'ocr' and self.store.config['source'] == 'wechat_db':
+            raise ValueError('旧 OCR 名单尚未迁移，请重新保存自动回复名单。')
+        if source == 'ocr' and (self.auto_allowlist[0]['session_id'] != self.live_id or self.status['capture'] != 'live'):
+            raise ValueError('请让已选的 OCR 会话保持在当前可见的微信窗口。')
+        from core.client import resolve_decision, resolve_reply
+        cfg = self.store.full_config()
+        if resolve_reply(cfg, resolve_decision(cfg)) is None:
+            raise ValueError('当前判断服务没有回复生成模型，请先配置生成服务。')
+        self.auto_policy['session_ids'] = [entry['session_id'] for entry in self.auto_allowlist]
+        self.auto_policy['enabled'] = True
+        self.auto_paused = False
+        self.auto_failures = 0
+        self.auto_detail = ('自动回复已启用；只处理启用之后的新入站文字。微信只需登录（可收在托盘），'
+                            '发送时会临时唤起窗口、切到目标会话并核验后发送，随后自动收起。'
+                            if source == 'wechat_db' else
+                            '自动回复已启用；只处理启用之后的新入站文字，发送前还会核验微信窗口和输入框。')
+        if self.status['capture'] not in ('live', 'searching'):
+            self.capture.start(cfg)
+            self.status.update(capture='searching', detail='正在连接微信本地数据库…' if source == 'wechat_db' else '正在定位微信窗口…')
+        try:
+            self._save_auto_state()
+        except OSError:
+            self.auto_policy['enabled'] = False
+            self.auto_detail = '无法保存自动回复状态，已拒绝启动。'
+            raise
+        self._auto_log('', 'started', f'{len(self.auto_allowlist)} 个会话，重启后{"自动恢复" if self.auto_resume else "需手动开启"}')
+        self.emit()
+        return self._auto_public()
+
+    def _stop_auto(self, emergency=False, pause=False):
+        self._cancel_auto_work()
+        if pause:
+            self.auto_paused = True
+            self.auto_detail = '自动回复已暂停；新消息不会发送。'
+        else:
+            self.auto_policy['enabled'] = False
+            self.auto_paused = False
+            if emergency:
+                self.auto_resume = False
+            self.auto_detail = '紧急停止已生效；已提交给微信的消息无法撤回。' if emergency else '自动回复已关闭。'
+        self._auto_log('', 'paused' if pause else 'emergency_stop' if emergency else 'stopped', self.auto_detail)
+        self._save_auto_state()
+        self.emit()
+        return self._auto_public()
+
+    def _auto_observe(self, session, message, capture_event):
+        if not self.auto_policy['enabled'] or self.auto_paused:
+            return None
+        if message.get('side') != 'other' or message.get('kind', 'text') != 'text' or not str(message.get('text') or '').strip():
+            return None
+        sid = session['id']
+        chosen = next((item for item in self.auto_allowlist if item['session_id'] == sid), None)
+        if not chosen:
+            return None
+        if chosen['type'] == 'group' and not str(message.get('sender') or '').strip():
+            self.auto_detail = '群聊发言人无法核对，未自动回复。'
+            return None
+        if capture_event.get('source') == 'ocr':
+            if capture_event.get('sidebar_changed') is not True:
+                self.auto_detail = '左侧会话摘要没有出现新的签名；滚动或旧消息不会触发自动回复。'
+                return None
+            if capture_event.get('tail_baseline_verified') is not True:
+                self.auto_detail = '新摘要无法与可见聊天尾部核对，跳过本轮并继续监听。'
+                return None
+            if capture_event.get('tail_verified') is not True:
+                self.auto_detail = '最新文字过短，未通过自动回复尾部核验；继续等待。'
+                return None
+            if chosen['type'] == 'group' and len(re.sub(r'\s+', '', str(message.get('text') or ''))) < 8:
+                self.auto_detail = '群聊消息过短，无法排除相似旧消息，本轮未自动发送。'
+                return None
+            text_key = re.sub(r'\s+', '', str(message.get('text') or ''))
+            if any(m.get('side') == 'other' and m.get('sender') == message.get('sender') and
+                   re.sub(r'\s+', '', str(m.get('text') or '')) == text_key
+                   for m in session.get('messages', [])[:-1][-100:]):
+                self.auto_detail = '近期出现相同发言人和内容，无法可靠去重，本轮未自动发送。'
+                return None
+        if self.auto_send_busy:
+            # Coalesce a burst to its newest incoming turn. The send completion
+            # will recheck that this is still the latest message before judging.
+            self.auto_deferred = {'session_id': sid, 'message_id': message['id'],
+                                  'source': capture_event.get('source'),
+                                  'sidebar_changed': capture_event.get('sidebar_changed'),
+                                  'sidebar_signature': capture_event.get('sidebar_signature'),
+                                  'tail_baseline_verified': capture_event.get('tail_baseline_verified'),
+                                  'tail_verified': capture_event.get('tail_verified'),
+                                  'observed_at': time.time()}
+            self.auto_detail = '发送中收到新消息；完成后将重新核对最新一轮。'
+            return None
+        counters = self._auto_public()
+        if counters['sent_hour'] >= self.auto_policy['hourly_limit'] or counters['sent_day'] >= self.auto_policy['daily_limit']:
+            self.auto_detail = '自动回复已达到发送上限，未为这条消息调用模型。'
+            return None
+        typed = {**session, 'type': chosen['type']}
+        source = capture_event.get('source')
+        event = {'source': source, 'historical': bool(capture_event.get('historical')),
+                 'incoming': True, 'live_visible': source == 'ocr' and sid == self.live_id,
+                 'sidebar_signature': capture_event.get('sidebar_signature') or '',
+                 'timestamp': capture_event.get('observed_at') or time.time()}
+        observed = self.auto_guard.observe(typed, message, event, {'auto_reply_enabled': True}, self.auto_policy)
+        if not observed.allow:
+            self._auto_log(sid, 'ignored', observed.reason)
+            return None
+        try:
+            self._save_auto_state()
+        except OSError:
+            self.auto_paused = True
+            self.auto_detail = '无法保存新消息去重状态，自动回复已暂停。'
+            return None
+        wait_me = self.auto_policy.get('wait_me_seconds', 0)
+        ready_at = observed.ready_at + wait_me
+        self.auto_trigger = {'session_id': sid, 'message': copy.deepcopy(message), 'event': event,
+                             'ready_at': ready_at, 'epoch': self.auto_epoch,
+                             'type': chosen['type']}
+        self.auto_detail = (f'收到新消息，先等你 {wait_me} 秒；你没回的话就自动回复。' if wait_me else
+                            '已检测到允许会话的新消息，正在等待对方发完并准备回复。')
+        self._auto_log(sid, 'observed', f'等待 {round(ready_at - time.time())} 秒后处理')
+        return max(0, int((ready_at - time.time()) * 1000))
+
+    def _auto_dispatch(self, trigger, result, judged):
+        sid = trigger['session_id']
+        if (not self.auto_policy['enabled'] or self.auto_paused or self.auto_send_busy or
+                trigger['epoch'] != self.auto_epoch or
+                (trigger['event'].get('source') != 'wechat_db' and sid != self.live_id) or
+                self.status['capture'] != 'live'):
+            self._auto_record(sid, 'skipped', '会话或自动回复状态已变化')
+            return
+        session = self.sessions.get(sid)
+        if not session or not session.get('messages') or session['messages'][-1].get('id') != trigger['message']['id']:
+            self._auto_record(sid, 'skipped', '已有更新的消息，旧候选未发送')
+            return
+        risk = result.get('risk')
+        if isinstance(risk, bool) or not isinstance(risk, (int, float)) or not 0 <= risk <= 3:
+            self._auto_record(sid, 'skipped', '风险判断较高或缺失，未自动发送')
+            return
+        if (judged.get('should_reply') is not True or
+                judged.get('target_message_id') != trigger['message']['id']):
+            self._auto_record(sid, 'skipped', '模型未明确认为现在值得回复这条消息')
+            return
+        if (trigger['type'] == 'group' and self.auto_policy['group_mode'] == 'all'
+                and trigger['message'].get('directed_to_me') is not True):
+            confidence = judged.get('confidence')
+            if (isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or
+                    confidence < 0.85):
+                self._auto_record(sid, 'skipped', '群聊未明确指向我，模型回复置信度不足')
+                return
+        prior = next((str(m.get('text') or '') for m in reversed(session['messages'][:-1])
+                      if m.get('kind', 'text') == 'text' and str(m.get('text') or '').strip()), '')
+        if not prior:
+            self._auto_record(sid, 'skipped', '缺少可核验的上一条上下文，未发送')
+            return
+        candidates, index = result.get('candidates') or [], result.get('best_index')
+        if not isinstance(index, int) or not 0 <= index < len(candidates):
+            self._auto_record(sid, 'skipped', '没有经过模型排序的可用回复')
+            return
+        draft = str(candidates[index].get('text') or '').strip()
+        reply = draft.replace(AUTO_DISCLOSURE, '').rstrip()
+        typed = {**session, 'type': trigger['type']}
+        claimed = self.auto_guard.claim(typed, trigger['message'], trigger['event'],
+                                        {'auto_reply_enabled': True}, self.auto_policy,
+                                        reply, incoming_text=trigger['message'].get('text', ''))
+        if not claimed.allow:
+            self._auto_record(sid, 'skipped', '发送边界未通过：' + claimed.reason)
+            return
+        # Claim before dispatch prevents reconnect/restart from sending twice.
+        try:
+            self._save_auto_state()
+        except OSError:
+            self.auto_paused = True
+            self.auto_detail = '无法保存发送去重状态，自动回复已暂停。'
+            self._auto_record(sid, 'failed', '发送状态未能安全保存')
+            return
+        self.auto_send_busy = True
+        self.auto_last_reply = (sid, draft)
+        self.auto_detail = '正在用数据库核验最新来信，并检查微信标题与输入框。' if trigger['event'].get('source') == 'wechat_db' else '正在对微信当前窗口与输入框做最终核验。'
+        sender = trigger['message'].get('sender', '') if trigger['type'] == 'group' else ''
+        try:
+            if trigger['event'].get('source') == 'wechat_db':
+                future = self.pool.submit(self.capture.send_db, reply, sid, trigger['message']['id'])
+            else:
+                future = self.pool.submit(self.capture.send, reply, session['title'],
+                                          trigger['message'].get('text', ''), sender, prior,
+                                          trigger['event'].get('sidebar_signature', ''))
+            future.add_done_callback(lambda done: self._emit_auto_send_done(sid, trigger['epoch'], done))
+        except Exception:
+            self.auto_send_busy = False
+            self.auto_paused = True
+            self.auto_detail = '自动发送任务未能启动，已暂停。'
+            self._auto_record(sid, 'failed', '发送任务启动失败')
+
+    def _emit_auto_send_done(self, sid, epoch, future):
+        if self.closed:
+            return
+        if future.cancelled():
+            self.autoSendFinished.emit(sid, {'epoch': epoch}, '自动发送任务已取消')
+            return
+        try:
+            self.autoSendFinished.emit(sid, {'epoch': epoch, 'result': future.result()}, None)
+        except Exception as exc:
+            self.autoSendFinished.emit(sid, {'epoch': epoch}, self.safe_error(exc))
+
+    def _on_auto_sent(self, sid, payload, error):
+        if self.closed:
+            return
+        self.auto_send_busy = False
+        result = payload.get('result') if isinstance(payload, dict) else None
+        status = result.get('status') if isinstance(result, dict) else None
+        last, self.auto_last_reply = self.auto_last_reply, None
+        if last and last[0] == sid and status in ('sent', 'sent_unconfirmed'):
+            try:
+                self.reply_history.mark_sent(sid, last[1], status)
+            except OSError:
+                pass
+        if status == 'sent':
+            self.auto_failures = 0
+            self._auto_record(sid, 'sent', '已在目标微信会话确认发出消息')
+            self.auto_detail = '上一条回复已在目标会话确认；继续等待新消息。'
+        elif status == 'sent_unconfirmed':
+            # 去重已在 claim 时落盘，不会重发；只记录待人工确认，不暂停。
+            self.auto_failures = 0
+            self._auto_record(sid, 'unconfirmed', '已按下发送键，但未在时限内确认送达；请抽空检查微信')
+            self.auto_detail = '上一条回复未能确认送达，继续监听；请抽空检查微信。'
+        else:
+            # 核验失败本身是安全拒发；连续 3 次才暂停，避免一次瞬时失败就停摆。
+            self.auto_failures += 1
+            detail = (error.split('：', 1)[1][:160] if isinstance(error, str) and error.startswith('数据库发送核验：')
+                      else '安全核验或发送失败，本条未发送')
+            self._auto_record(sid, 'failed', detail)
+            if self.auto_failures >= 3:
+                self.auto_paused = True
+                self.auto_detail = detail + ' 已连续 3 次失败，自动回复已暂停。'
+            else:
+                self.auto_detail = detail + f'（连续失败 {self.auto_failures}/3，继续监听）'
+        self._save_auto_state()
+        self._resume_deferred_auto()
+        self.emit()
+
+    def _resume_deferred_auto(self):
+        deferred, self.auto_deferred = self.auto_deferred, None
+        if (not deferred or not self.auto_policy['enabled'] or self.auto_paused or
+                self.auto_send_busy or self.status['capture'] != 'live'):
+            return
+        sid = deferred['session_id']
+        session = self.sessions.get(sid)
+        if ((deferred['source'] != 'wechat_db' and sid != self.live_id)
+                or not session or not session.get('messages') or
+                session['messages'][-1].get('id') != deferred['message_id']):
+            return
+        message = session['messages'][-1]
+        if message.get('side') != 'other':
+            return
+        delay = self._auto_observe(session, message, {
+            'source': deferred['source'], 'historical': False,
+            'sidebar_changed': deferred.get('sidebar_changed'),
+            'sidebar_signature': deferred.get('sidebar_signature'),
+            'tail_baseline_verified': deferred.get('tail_baseline_verified'),
+            'tail_verified': deferred.get('tail_verified'),
+            'observed_at': deferred['observed_at']})
+        if delay is not None:
+            self.pending = sid
+            self.pending_manual = False
+            self.timer.start(max(self.store.config['debounce_ms'], delay))
+
+    def _prepare_catchup_task(self, cfg, session, chat_type, own_display_name, group_mode):
+        judged = self.models.submit('judge_backlog', {
+            'messages': session['messages'], 'config': cfg, 'chat_type': chat_type,
+            'chat_name': session['title'], 'own_display_name': own_display_name,
+            'current_session_acknowledged': True,
+            'group_mode': group_mode}).result(timeout=180)
+        if judged.get('should_reply') is not True:
+            return {'judged': judged, 'analysis': None}
+        draft_config = dict(cfg)
+        draft_config['style'] = (str(draft_config.get('style') or '')[:2000] +
+                                 '\n一次性历史补回请用不超过130字的自然短句，只回答仍然需要回应的最后一轮消息。'
+                                 '不编造事实或承诺；无需添加来源标识，应用会在发送前处理来源说明。')
+        analyzed = self.models.submit('analyze', {'messages': session['messages'],
+            'config': draft_config, 'background': '', 'history': None, 'reply_to': None}).result(timeout=180)
+        return {'judged': judged, 'analysis': analyzed}
+
+    def _prepare_live_auto_task(self, cfg, session, analysis_payload, trigger, group_mode):
+        """Require a typed send-now judgment before paying for a draft."""
+        judged = self.models.submit('judge_backlog', {
+            'messages': session['messages'], 'config': cfg, 'chat_type': trigger['type'],
+            'chat_name': session['title'], 'own_display_name': '',
+            'current_session_acknowledged': True, 'group_mode': group_mode,
+            # 新联系人或上下文较短时也应能回复，是否值得回复交给模型判断。
+            'require_prior_self': False}).result(timeout=180)
+        if (judged.get('should_reply') is not True or
+                judged.get('target_message_id') != trigger['message']['id']):
+            return {'_auto_decision': judged}
+        analyzed = self.models.submit('analyze', analysis_payload).result(timeout=180)
+        analyzed['_auto_decision'] = judged
+        return analyzed
+
+    def _catch_up_once(self, params):
+        if params.get('acknowledge_send') is not True:
+            raise ValueError('请确认：一次性历史补回可能向当前微信会话直接发送一条消息。')
+        if self.catchup_busy or self.auto_send_busy or (self.auto_policy['enabled'] and not self.auto_paused):
+            raise ValueError('已有自动回复任务在运行，请先暂停后再执行历史补回。')
+        if not self.store.secrets['api_key']:
+            raise ValueError('请先配置模型 API Key。')
+        sid = str(params.get('session_id') or '')[:256]
+        chosen = next((item for item in self.auto_allowlist if item['session_id'] == sid), None)
+        if not chosen or chosen.get('source') not in ('ocr', 'weflow', 'wechat_db'):
+            raise ValueError('历史补回只允许名单内的实时会话，导入归档不能发送。')
+        session = self.sessions.get(sid)
+        db_selected = chosen['source'] == 'wechat_db'
+        if (not session or (not db_selected and sid != self.live_id) or self.status['capture'] != 'live' or
+                session.get('source') != chosen['source'] or len(session.get('messages') or []) < 2):
+            raise ValueError('请先读取目标会话至少两条可核对的上下文。')
+        if session['messages'][-1].get('side') != 'other':
+            raise ValueError('你已是最后发言人；没有待补回的最新来信。')
+        if session['messages'][-1].get('kind', 'text') != 'text':
+            raise ValueError('历史补回目前只支持最后一条为文字消息。')
+        if chosen['type'] == 'group' and not str(session['messages'][-1].get('sender') or '').strip():
+            raise ValueError('群聊最后发言人无法核对，已拒绝历史补回。')
+        from core.client import resolve_decision, resolve_reply
+        cfg = self.store.full_config()
+        if resolve_reply(cfg, resolve_decision(cfg)) is None:
+            raise ValueError('当前判断服务没有可用的回复生成模型。')
+        own_display_name = str(params.get('own_display_name') or '').strip()[:80]
+        self.auto_policy['session_ids'] = [entry['session_id'] for entry in self.auto_allowlist]
+        self.catchup_serial += 1
+        serial = self.catchup_serial
+        frozen = copy.deepcopy(session)
+        fingerprint = self.fingerprint(frozen)
+        self.catchup_busy = True
+        self.catchup = {'session_id': sid, 'status': 'judging',
+                        'reason': '正在判断最近一轮历史来信是否仍值得回复。'}
+        try:
+            future = self.pool.submit(self._prepare_catchup_task, cfg, frozen, chosen['type'],
+                                      own_display_name, self.auto_policy['group_mode'])
+            future.add_done_callback(lambda done: self._emit_catchup_prepared(serial, sid, fingerprint, done))
+        except Exception:
+            self.catchup_busy = False
+            self.catchup = {'session_id': sid, 'status': 'failed', 'reason': '历史判断任务未能启动。'}
+            raise
+        self.emit()
+        return {'started': True, 'session_id': sid}
+
+    def _emit_catchup_prepared(self, serial, sid, fingerprint, future):
+        if self.closed or future.cancelled():
+            return
+        try:
+            self.catchUpPrepared.emit(serial, sid, fingerprint, future.result(), None)
+        except Exception as exc:
+            self.catchUpPrepared.emit(serial, sid, fingerprint, None, self.safe_error(exc))
+
+    def _on_catchup_prepared(self, serial, sid, fingerprint, prepared, error):
+        if self.closed or serial != self.catchup_serial or not self.catchup_busy:
+            return
+        session = self.sessions.get(sid)
+        if error or not prepared:
+            self.catchup = {'session_id': sid, 'status': 'failed', 'reason': '历史判断或草稿生成未完成。'}
+            self.catchup_busy = False
+            self._auto_record(sid, 'failed', '历史判断或草稿生成失败')
+        elif (not session or (session.get('source') != 'wechat_db' and sid != self.live_id) or self.status['capture'] != 'live' or
+                self.fingerprint(session) != fingerprint):
+            self.catchup = {'session_id': sid, 'status': 'skipped', 'reason': '会话或最近消息已变化，旧判断未发送。'}
+            self.catchup_busy = False
+            self._auto_record(sid, 'skipped', '会话或最近消息已变化')
+        else:
+            judged = prepared.get('judged') or {}
+            analyzed = prepared.get('analysis') or {}
+            target = session['messages'][-1]
+            if judged.get('should_reply') is not True or judged.get('target_message_id') != target.get('id'):
+                self.catchup = {'session_id': sid, 'status': 'skipped',
+                                'reason': '模型判断当前没有需要补回的明确消息。'}
+                self.catchup_busy = False
+                self._auto_record(sid, 'skipped', '历史消息不需回复或判断不充分')
+            elif (analyzed.get('should_reply') is not True or
+                  isinstance(analyzed.get('risk'), bool) or
+                  not isinstance(analyzed.get('risk'), (int, float)) or
+                  not 0 <= analyzed['risk'] <= 3):
+                self.catchup = {'session_id': sid, 'status': 'skipped',
+                                'reason': '回复时机或风险判断未满足自动发送条件。'}
+                self.catchup_busy = False
+                self._auto_record(sid, 'skipped', '回复时机或风险条件不满足')
+            else:
+                candidates, index = analyzed.get('candidates') or [], analyzed.get('best_index')
+                if not isinstance(index, int) or not 0 <= index < len(candidates):
+                    self.catchup = {'session_id': sid, 'status': 'skipped', 'reason': '没有完成模型排序的候选回复。'}
+                    self.catchup_busy = False
+                    self._auto_record(sid, 'skipped', '没有完成候选排序')
+                else:
+                    reply = str(candidates[index].get('text') or '').strip().replace(AUTO_DISCLOSURE, '').rstrip()
+                    previous = next((str(m.get('text') or '') for m in reversed(session['messages'][:-1])
+                                     if m.get('kind', 'text') == 'text' and str(m.get('text') or '').strip()), '')
+                    typed = {**session, 'type': next((item['type'] for item in self.auto_allowlist
+                                if item['session_id'] == sid), 'unknown')}
+                    claimed = self.auto_guard.claim_backlog(typed, target, self.auto_policy, reply,
+                                acknowledged=True, incoming_text=target.get('text', '')) if previous else None
+                    if not claimed or not claimed.allow:
+                        self.catchup = {'session_id': sid, 'status': 'skipped',
+                                        'reason': '重复、限额、草稿或可见上下文未通过发送边界。'}
+                        self.catchup_busy = False
+                        self._auto_record(sid, 'skipped', '发送边界未通过')
+                    else:
+                        try:
+                            self._save_auto_state()
+                            sender = target.get('sender', '') if typed['type'] == 'group' else ''
+                            self.catchup = {'session_id': sid, 'status': 'sending',
+                                            'reason': '正在核验数据库最新来信、微信标题与输入框。'}
+                            if session.get('source') == 'wechat_db':
+                                future = self.pool.submit(self.capture.send_db, reply, sid, target['id'])
+                            else:
+                                future = self.pool.submit(self.capture.send, reply, session['title'],
+                                                          target.get('text', ''), sender, previous)
+                            future.add_done_callback(lambda done: self._emit_catchup_sent(serial, sid, done))
+                        except Exception:
+                            self.catchup = {'session_id': sid, 'status': 'failed',
+                                            'reason': '无法安全保存或启动发送任务。'}
+                            self.catchup_busy = False
+                            self._auto_record(sid, 'failed', '发送任务未启动')
+        self.emit()
+
+    def _emit_catchup_sent(self, serial, sid, future):
+        if self.closed or future.cancelled():
+            return
+        try:
+            self.catchUpSent.emit(serial, sid, future.result(), None)
+        except Exception as exc:
+            self.catchUpSent.emit(serial, sid, None, self.safe_error(exc))
+
+    def _on_catchup_sent(self, serial, sid, result, error):
+        if self.closed or serial != self.catchup_serial or not self.catchup_busy:
+            return
+        self.catchup_busy = False
+        status = result.get('status') if isinstance(result, dict) else None
+        if status == 'sent':
+            self.catchup = {'session_id': sid, 'status': 'sent',
+                            'reason': '已确认目标会话发出的消息。'}
+            self._auto_record(sid, 'sent', '一次性历史补回已确认发出')
+        elif status == 'sent_unconfirmed':
+            self.catchup = {'session_id': sid, 'status': 'failed',
+                            'reason': '已按下发送键，但未确认发出；请检查微信，系统不会重试。'}
+            self._auto_record(sid, 'failed', '发送结果不确定，未重试')
+        else:
+            self.catchup = {'session_id': sid, 'status': 'failed',
+                            'reason': '发送前核验未通过或任务失败；没有自动重试。'}
+            self._auto_record(sid, 'failed', '发送前核验失败')
+        self._save_auto_state()
+        self.emit()
+
+    def _sync_hub(self):
+        self.hub.set_local_sessions(self.sessions)
+
+    def _remember_catalog(self, items):
+        with self.catalog_lock:
+            for item in items:
+                if item.get('id'):
+                    self.catalog_items[item['id']] = dict(item)
+                    self.catalog_items.move_to_end(item['id'])
+            while len(self.catalog_items) > 5000:
+                self.catalog_items.popitem(last=False)
+
+    def _catalog_cursor(self, state):
+        ident = uuid.uuid4().hex
+        with self.catalog_lock:
+            self.catalog_cursors[ident] = (time.monotonic(), state)
+            while len(self.catalog_cursors) > 300:
+                self.catalog_cursors.popitem(last=False)
+        return ident
+
+    def _read_catalog_cursor(self, value, source, query):
+        with self.catalog_lock:
+            entry = self.catalog_cursors.get(str(value or ''))
+        if not entry or time.monotonic() - entry[0] > 600 or entry[1]['source'] != source or entry[1]['query'] != query:
+            raise ValueError('会话分页已过期，请重新搜索。')
+        return copy.deepcopy(entry[1])
+
+    def _import_folder_task(self, root):
+        """Enumerate and index a chosen export directory off the UI thread."""
+        root = Path(root).resolve()
+        files = []
+        for path in root.rglob('*'):
+            try:
+                if (not path.is_file() or path.suffix.lower() not in ('.json', '.jsonl')
+                        or not path.resolve().is_relative_to(root)
+                        or path.stat().st_size > 1024 * 1024 * 1024):
+                    continue
+                with path.open('rb') as stream:
+                    head = stream.read(4096)
+                if b'"chatlab"' not in head and not (b'"_type"' in head and b'"header"' in head):
+                    continue
+                files.append(str(path))
+                if len(files) > 5000:
+                    raise ValueError('目录中超过 5000 份聊天文件，请分批导入。')
+            except OSError:
+                continue
+        if not files:
+            raise ValueError('目录中没有可识别的 ChatLab JSON/JSONL 文件。')
+        aggregate = {'success': True, 'sessions': 0, 'messages': 0, 'items': [], 'skipped': 0}
+        for index, filename in enumerate(files, 1):
+            try:
+                result = self.imports.import_files([filename])
+                aggregate['sessions'] += result['sessions']
+                aggregate['messages'] += result['messages']
+                aggregate['items'].extend(result['items'])
+            except (OSError, ValueError, json.JSONDecodeError):
+                aggregate['skipped'] += 1
+            self.dataEvent.emit('import_progress', {'files_done': index, 'files_total': len(files),
+                                'messages': aggregate['messages'], 'sessions': aggregate['sessions']})
+        if not aggregate['sessions']:
+            raise ValueError('未成功导入任何 ChatLab 会话，请检查导出格式与帐号 ID。')
+        return aggregate
+
+    def _catalog_item(self, item):
+        result = dict(item)
+        result['is_group'] = item.get('type') == 'group' or str(item.get('talker') or '').endswith('@chatroom')
+        source = item.get('source')
+        result['auto_reply_eligible'] = bool(source in ('weflow', 'wechat_db') or
+                                             (source == 'ocr' and item.get('id') == self.live_id and self.status['capture'] == 'live'))
+        result['auto_reply_type_known'] = source in ('weflow', 'wechat_db') and item.get('type') in ('private', 'group')
+        return result
+
+    @staticmethod
+    def _wechat_db_reader():
+        account, storage, connections = discover_cipher_source()
+        return WeChatDBSource(storage, self_wxid=account.wxid,
+                              self_display_name=account.display_name, connect_factory=connections)
+
+    def _wechat_db_catalog_page(self, query, cursor, limit):
+        state = self._read_catalog_cursor(cursor, 'wechat_db', query) if cursor else {'offset': 0}
+        offset = int(state['offset'])
+        reader = self._wechat_db_reader()
+        # Read the first page immediately. Name search is a bounded walk over
+        # SessionTable pages until the adapter can use a contact-name index.
+        if not query:
+            rows = reader.sessions(limit + 1, offset)
+            selected = rows[:limit]
+            next_offset = offset + len(selected)
+            more = len(rows) > limit
+        else:
+            selected, next_offset, more = [], offset, False
+            scanned = 0
+            needle = query.casefold()
+            while len(selected) <= limit and scanned < 20000:
+                batch = reader.sessions(200, next_offset)
+                if not batch:
+                    break
+                for row in batch:
+                    next_offset += 1
+                    if needle in str(row.get('name') or '').casefold() or needle in str(row.get('id') or '').casefold():
+                        selected.append(row)
+                        if len(selected) > limit:
+                            more = True
+                            break
+                scanned += len(batch)
+                if more or len(batch) < 200:
+                    break
+            if more:
+                selected = selected[:limit]
+                # The overflow row must be reconsidered on the next page.
+                next_offset -= 1
+        items = [{'id': row['id'], 'title': row.get('name') or row['id'], 'type': row.get('type'),
+                  'source': 'wechat_db', 'talker': row['id'], 'preview': row.get('preview') or '',
+                  'updated': row.get('sort_timestamp') or row.get('timestamp') or 0,
+                  'last_message_kind': {3: 'image', 34: 'voice'}.get(row.get('last_msg_type'))}
+                 for row in selected]
+        next_cursor = self._catalog_cursor({'source': 'wechat_db', 'query': query, 'offset': next_offset}) if more else None
+        return {'items': items, 'next_cursor': next_cursor, 'has_more': bool(next_cursor),
+                'source': 'wechat_db', 'scope': 'all_available', 'available': True,
+                'warning': None, 'total_loaded': len(items)}
+
+    def _list_sessions_task(self, config, query, cursor, limit, source, collected_snapshot=None):
+        query = str(query or '').strip()[:100]
+        limit = min(50, max(1, int(limit or 20)))
+        source = source if source in ('all', 'weflow', 'wechat_db', 'import', 'collected') else 'all'
+        if source == 'all' and config.get('source') == 'wechat_db':
+            source = 'wechat_db'
+        if source == 'import':
+            result = self.imports.list_sessions(query, cursor, limit)
+        elif source == 'wechat_db':
+            try:
+                result = self._wechat_db_catalog_page(query, cursor, limit)
+            except Exception:
+                result = {'items': [], 'next_cursor': None, 'has_more': False, 'source': 'wechat_db',
+                          'scope': 'unavailable', 'available': False,
+                          'warning': '无法只读访问本机微信数据库；请检查本机微信数据库工具的已配置账号和微信登录状态。'}
+        elif source == 'collected':
+            state = self._read_catalog_cursor(cursor, source, query) if cursor else {'offset': 0}
+            rows = [self._catalog_item({'id': item['id'], 'title': item['title'], 'source': item.get('source', 'ocr'),
+                     'type': item.get('type', 'unknown'), 'preview': (item.get('messages') or [{}])[-1].get('text', '')[:140],
+                     'updated': item.get('updated'), 'count': len(item.get('messages', []))})
+                    for item in (collected_snapshot or []) if item.get('source') != 'import' and query.casefold() in item.get('title', '').casefold()]
+            rows.sort(key=lambda row: row.get('updated') or 0, reverse=True)
+            offset = state['offset']
+            next_cursor = self._catalog_cursor({'source': source, 'query': query, 'offset': offset + limit}) if offset + limit < len(rows) else None
+            result = {'items': rows[offset:offset + limit], 'next_cursor': next_cursor, 'has_more': bool(next_cursor),
+                      'source': 'collected', 'scope': 'collected_only', 'available': False, 'total': len(rows),
+                      'warning': '这里仅包含 ChatBot 已经读取的会话。'}
+        elif source == 'weflow':
+            if not config.get('weflow_token'):
+                result = {'items': [], 'next_cursor': None, 'has_more': False, 'source': 'weflow',
+                          'scope': 'unavailable', 'available': False, 'warning': '需要在高级设置连接本机 WeFlow 服务。'}
+            else:
+                result = self.hub.list_sessions({**config, 'source': 'weflow'}, query, cursor, limit)
+        else:
+            state = self._read_catalog_cursor(cursor, source, query) if cursor else {
+                'source': source, 'query': query, 'hub_buf': [], 'imp_buf': [],
+                'hub_cursor': None, 'imp_cursor': None, 'hub_more': True, 'imp_more': True,
+                'seen': [], 'hub_warning': None, 'hub_available': False,
+            }
+            output = []
+            attempts = 0
+            while len(output) < limit and attempts < limit * 5 + 4:
+                attempts += 1
+                if not state['hub_buf'] and state['hub_more']:
+                    cfg = {**config, 'source': 'weflow'} if config.get('weflow_token') else {**config, 'source': 'ocr'}
+                    page = self.hub.list_sessions(cfg, query, state['hub_cursor'], limit)
+                    state['hub_buf'] = [self._catalog_item(item) for item in page['items']]
+                    state['hub_cursor'], state['hub_more'] = page.get('next_cursor'), bool(page.get('has_more'))
+                    state['hub_warning'], state['hub_available'] = page.get('warning'), bool(page.get('available'))
+                if not state['imp_buf'] and state['imp_more']:
+                    page = self.imports.list_sessions(query, state['imp_cursor'], limit)
+                    state['imp_buf'] = [self._catalog_item(item) for item in page['items']]
+                    state['imp_cursor'], state['imp_more'] = page.get('next_cursor'), bool(page.get('has_more'))
+                candidates = [(state[k][0].get('updated') or 0, k) for k in ('hub_buf', 'imp_buf') if state[k]]
+                if not candidates:
+                    break
+                _, selected = max(candidates)
+                item = state[selected].pop(0)
+                if item['id'] not in state['seen']:
+                    output.append(item)
+                    state['seen'].append(item['id'])
+                    state['seen'] = state['seen'][-5000:]
+            more = bool(state['hub_buf'] or state['imp_buf'] or state['hub_more'] or state['imp_more'])
+            next_cursor = self._catalog_cursor(state) if more and output else None
+            archive_count = self.imports.count()
+            result = {'items': output, 'next_cursor': next_cursor, 'has_more': bool(next_cursor),
+                      'source': 'mixed' if archive_count and state['hub_available'] else 'weflow' if state['hub_available'] else 'local',
+                      'scope': 'all_available' if state['hub_available'] else 'imported_archive' if archive_count else 'collected_only',
+                      'available': bool(state['hub_available'] or archive_count),
+                      'warning': state['hub_warning'], 'total_loaded': len(output)}
+        result['items'] = [self._catalog_item(item) for item in result.get('items', [])]
+        result['detail'] = result.get('warning') or ''
+        self._remember_catalog(result['items'])
+        self.dataEvent.emit('catalog_meta', {key: result.get(key) for key in ('source', 'scope', 'available', 'warning', 'total_loaded')})
+        return result
+
+    def _session_page_task(self, config, sid, cursor=None, limit=50):
+        if sid.startswith('import:'):
+            return self.imports.messages(sid, cursor, limit)
+        with self.catalog_lock:
+            source = (self.catalog_items.get(sid) or {}).get('source')
+        if source == 'wechat_db' or (config.get('source') == 'wechat_db' and not sid.startswith(('ocr:', 'weflow:'))):
+            reader = self._wechat_db_reader()
+            before = self._read_catalog_cursor(cursor, 'wechat_db_messages', sid)['before'] if cursor else None
+            rows = reader.messages(sid, limit=min(100, int(limit)) + 1, before=before)
+            selected = rows[:limit]
+            next_cursor = (self._catalog_cursor({'source': 'wechat_db_messages', 'query': sid,
+                           'before': selected[-1]['_cursor']}) if len(rows) > limit and selected else None)
+            items = [{k: v for k, v in row.items() if k != '_cursor'} for row in reversed(selected)]
+            return {'items': items, 'next_cursor': next_cursor, 'has_more': bool(next_cursor),
+                    'source': 'wechat_db', 'available': True, 'scope': 'wechat_db_history',
+                    'order': 'chronological', 'direction': 'older'}
+        return self.hub.messages(config, sid, cursor, limit)
+
+    def _session_first_page(self, config, sid):
+        page = self._session_page_task(config, sid, None, 50)
+        if not page.get('available') and not page.get('items'):
+            raise ValueError(page.get('warning') or '无法读取这个会话，请检查数据源。')
+        if sid.startswith('import:'):
+            meta = self.imports.get_session(sid)
+        else:
+            with self.catalog_lock:
+                meta = copy.deepcopy(self.catalog_items.get(sid))
+        if not meta:
+            raise ValueError('会话目录已过期，请重新打开会话选择窗口。')
+        return {'session': {'id': sid, 'title': meta.get('title') or '未命名会话',
+                'source': meta.get('source') or page.get('source'), 'type': meta.get('type'),
+                'messages': page.get('items', []), 'updated': meta.get('updated') or 0,
+                'context_window': page.get('context_window'),
+                'next_cursor': page.get('next_cursor'), 'has_more': bool(page.get('has_more'))},
+                'page': page}
+
+    def _run_agent_task(self, source_config, model_config, selected):
+        """Read only the selected latest pages before entering the isolated model process."""
+        sessions = []
+        for sid, known in selected:
+            source = known.get('source') or ''
+            if source in ('ocr', 'manual'):
+                session = known
+            else:
+                try:
+                    page = self._session_page_task(source_config, sid, None, 40)
+                except Exception:
+                    raise ValueError('无法读取所选会话，请检查数据来源后重试。') from None
+                if not page.get('available') and not page.get('items'):
+                    raise ValueError('所选会话当前不可读取，请检查数据来源后重试。')
+                session = {**known, 'messages': page.get('items') or []}
+                if not page.get('available') and source == 'weflow':
+                    session['freshness'] = 'unavailable'
+                # A fresh source page can replace an in-memory transcript or
+                # image description added by an explicit user media action.
+                understood = {str(item.get('id')): item for item in known.get('messages', [])
+                              if isinstance(item, dict) and (item.get('transcript') or item.get('image_description'))}
+                for item in session['messages']:
+                    cached = understood.get(str(item.get('id'))) if isinstance(item, dict) else None
+                    if cached and item.get('kind') == cached.get('kind') and isinstance(cached.get('text'), str):
+                        item['text'] = cached['text']
+            messages = []
+            for raw in (session.get('messages') or [])[-40:]:
+                if not isinstance(raw, dict):
+                    continue
+                messages.append({
+                    'id': str(raw.get('id') or '')[:128],
+                    'side': raw.get('side') if raw.get('side') in ('me', 'other') else 'unknown',
+                    'sender': str(raw.get('sender') or '')[:80],
+                    'kind': raw.get('kind') or 'text',
+                    'text': str(raw.get('text') or '')[:1200],
+                    'timestamp': raw.get('timestamp') if isinstance(raw.get('timestamp'), (int, float, str)) else None,
+                    'directed_to_me': raw.get('directed_to_me') is True,
+                })
+            sessions.append({
+                'id': sid, 'title': str(session.get('title') or '未命名会话')[:200],
+                'type': session.get('type') if session.get('type') in ('private', 'group') else 'private' if source == 'manual' else 'unknown',
+                'source': str(session.get('source') or '')[:30],
+                'messages': messages,
+                'freshness': session.get('freshness', 'snapshot'),
+            })
+        return self.models.submit('run_agent', {'sessions': sessions, 'config': model_config}).result(timeout=185)
+
+    def _work_model_config(self, changes=None):
+        """Give the worker only its own route and one eligible credential."""
+        from core.client import _origin, validate_url
+        full = self.store.merged(changes or {})
+        base = str(full.get('work_base_url') or '').strip()
+        model = str(full.get('work_model') or '').strip()
+        key = str(full.get('work_api_key') or '').strip()
+        # 未单独配置 Work 模型时，直接复用主模型（OpenAI 兼容），做到"三项配置全链路可用"。
+        from core.client import resolve_decision
+        from .store import DEFAULTS
+        try:
+            main = resolve_decision(full)
+        except Exception:
+            main = None
+        if (main is not None and main.mode == 'chat_json' and not key
+                and base == DEFAULTS['work_base_url'] and model == DEFAULTS['work_model']):
+            return {'work_base_url': main.url, 'work_model': main.model, 'work_api_key': main.key, 'timeout': 60}
+        if not base or not model:
+            raise ValueError('请先填写 Work Agent 的 Base URL 和模型名。')
+        if not key and _origin(validate_url(base)) == _origin(validate_url(full.get('base_url') or '')):
+            key = str(full.get('api_key') or '').strip()
+        return {'work_base_url': base, 'work_model': model, 'work_api_key': key, 'timeout': 60}
+
+    def _work_turn_task(self, sid, text, attachment_ids, config):
+        self._work_phase(sid, 'reading')
+        prepared = self.work_agent.prepare_turn(sid, text, attachment_ids)
+        with self.work_agent_lock:
+            if sid in self.work_agent_cancelled:
+                raise ValueError('本轮任务已停止。')
+        model_future = self.models.submit('work_turn', {**prepared, 'config': config})
+        with self.work_agent_lock:
+            self.work_agent_jobs[sid] = model_future
+            cancelled = sid in self.work_agent_cancelled
+        if cancelled:
+            self.models.cancel(model_future)
+        self._work_phase(sid, 'model')
+        try:
+            result = model_future.result(timeout=905)
+        except Exception:
+            with self.work_agent_lock:
+                if sid in self.work_agent_cancelled:
+                    raise ValueError('本轮任务已停止。') from None
+            raise
+        finally:
+            with self.work_agent_lock:
+                self.work_agent_jobs.pop(sid, None)
+        with self.work_agent_lock:
+            if sid in self.work_agent_cancelled:
+                raise ValueError('本轮任务已停止。')
+            self.work_agent_phases[sid] = 'saving'
+        self.workAgentProgress.emit(sid, 'saving')
+        session = self.work_agent.commit_turn(sid, text, attachment_ids, result)
+        self._work_phase(sid, 'done')
+        latest = (session.get('messages') or [{}])[-1]
+        new_ids = set(latest.get('artifact_ids') or [])
+        artifacts = [item for item in session.get('artifacts', []) if item.get('id') in new_ids]
+        return {'session': session, 'result': {
+            'answer': str(result.get('answer') or '')[:120000],
+            'artifacts': artifacts, 'sources': result.get('sources') or [],
+            'trace': result.get('trace') or [], 'mode': result.get('mode') or 'direct',
+            'usage': result.get('usage') or {},
+        }}
+
+    def _work_phase(self, sid, phase):
+        with self.work_agent_lock:
+            if sid in self.work_agent_cancelled and phase != 'stopping':
+                return
+            self.work_agent_phases[sid] = phase
+        self.workAgentProgress.emit(sid, phase)
+
+    def _work_attach_task(self, sid, files):
+        return {'attachments': self.work_agent.attach_files(sid, files)}
+
+    def _work_test_task(self, config):
+        result = self.models.submit('work_turn', {'messages': [
+            {'role': 'user', 'content': '请用一句简短中文确认工作模型连接正常。', 'attachment_ids': []}],
+            'attachments': [], 'config': config}).result(timeout=305)
+        if not str(result.get('answer') or '').strip():
+            raise ValueError('工作模型未返回可读文字。')
+        return {'success': True, 'message': '工作模型已连通；测试只发送内置合成文字。'}
+
+    @staticmethod
+    def _work_export_task(source, target):
+        if source.resolve() == target.resolve():
+            return {'success': True}
+        temporary = target.with_name(target.name + '.' + uuid.uuid4().hex + '.tmp')
+        try:
+            with source.open('rb') as reader, temporary.open('xb') as writer:
+                shutil.copyfileobj(reader, writer)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {'success': True}
+
+    def _load_page(self, config, sid, cursor=None, limit=30):
+        page = self._session_page_task(config, sid, cursor, limit)
+        return page
+
+    def _history_analysis_task(self, cid, sid, config, question):
+        statistics = self.relationships.statistics(cid=cid, sid=sid)
+        corpus = self.relationships.corpus(cid=cid, sid=sid)
+        return self.models.submit('analyze_history', {'statistics': statistics, 'corpus': corpus,
+                                  'config': config, 'question': question}).result(timeout=185)
+
+    def _persona_chat_task(self, pid, text, config):
+        context = self.relationships.chat_context(pid, text)
+        result = self.models.submit('chat_persona', {'context': context, 'config': config}).result(timeout=185)
+        return self.relationships.append_turn(pid, context['revision'], context['message'], result)
+
+    def _sync_analysis_task(self, sid, meta, restart=False):
+        if sid.startswith('import:'):
+            return {'archive_id': sid, 'complete': True, 'indexed': 0}
+        if not meta or meta.get('source') != 'wechat_db':
+            raise ValueError('当前支持 ChatLab 导入或本机微信数据库索引；其它来源请先导出为 ChatLab。')
+        reader = self._wechat_db_reader()
+        owner = reader.self_wxid
+        source_id = f'wechat|{owner}|{sid}'
+        state = None if restart else self.relationships.sync_state(source_id)
+        before = json.loads(state['cursor']) if state and state['cursor'] and not state['complete'] else None
+        total, result = 0, None
+        for _ in range(5):
+            if self.closed:
+                raise RuntimeError('索引已随应用关闭停止。')
+            rows = reader.messages(sid, limit=101, before=before)
+            complete = len(rows) <= 100
+            selected = rows[:100]
+            before = list(selected[-1]['_cursor']) if selected else before
+            result = self.relationships.index_native_page(source_id, meta, owner, selected, before, complete)
+            total += len(selected)
+            if complete:
+                break
+        self.relationships.refresh_contacts()
+        return {**result, 'indexed': total, 'warning': '只读索引当前来源的历史快照；原媒体仍需导出文件。未完成时可继续，断点保存在本机。'}
+
+    def _sync_native_moments(self, cursor):
+        reader = self._wechat_db_reader()
+        page = reader.moments(limit=100, offset=max(0, int(cursor or 0)))
+        for post in page['items']:
+            self.relationships.save_moment(post, owner=reader.self_wxid, origin='wechat_db')
+        return {**page, 'indexed': len(page['items'])}
+
+    def _list_moments_task(self, config, sid, cursor, limit):
+        local = self.relationships.moments(sid=sid, cursor=cursor or 0, limit=limit) if not cursor or str(cursor).isdigit() else None
+        if local and local['available']:
+            with self.catalog_lock:
+                for post in local['items']:
+                    self.moment_posts[post['id']] = dict(post)
+            self.dataEvent.emit('moments_meta', {'available': True, 'source': 'local', 'warning': local['warning']})
+            return local
+        with self.catalog_lock:
+            selected = copy.deepcopy(self.catalog_items.get(sid)) if sid else None
+        if sid and not selected:
+            selected = self.imports.get_session(sid)
+        username = selected.get('talker') if selected and selected.get('source') == 'weflow' else ''
+        if sid and not username:
+            page = {'items': [], 'next_cursor': None, 'has_more': False, 'source': 'local',
+                    'available': False, 'scope': 'collected_only',
+                    'warning': '这位联系人没有可用的朋友圈帐号映射；可以手动补充其动态。'}
+        else:
+            page = self.hub.moments({**config, 'source': 'weflow'}, username or '', cursor, limit)
+        with self.catalog_lock:
+            manual = [copy.deepcopy(p) for p in reversed(self.manual_moments.values())
+                      if not sid or p.get('session_id') == sid]
+        if not cursor:
+            page['items'] = manual + page.get('items', [])
+        page['detail'] = page.get('warning') or ''
+        page['available'] = bool(page.get('available') or manual)
+        with self.catalog_lock:
+            for post in page['items']:
+                self.moment_posts[post['id']] = dict(post)
+                self.moment_posts.move_to_end(post['id'])
+            while len(self.moment_posts) > 500:
+                self.moment_posts.popitem(last=False)
+        self.dataEvent.emit('moments_meta', {'available': page['available'], 'source': page['source'],
+                                            'warning': page.get('warning')})
+        return page
+
+    # ---- 表情识别 -------------------------------------------------------------
+    @staticmethod
+    def _apply_sticker(message, note):
+        message['image_description'] = note
+        message['text'] = f'[表情：{note}]'
+
+    def _absorb_stickers(self, sid, messages, describe_recent=40):
+        """收下表情的下载信息（只在内存），给已识别过的表情填上描述，最近的未识别表情排队识别。"""
+        session_messages = self.sessions.get(sid, {}).get('messages', [])
+        recent = {m.get('id') for m in session_messages[-describe_recent:]}
+        for message in messages:
+            info = message.pop('emoji', None)
+            if isinstance(info, dict) and info.get('md5'):
+                md5 = info['md5']
+                message['emoji_md5'] = md5
+                self.sticker_sources[md5] = info
+                self.sticker_sources.move_to_end(md5)
+                while len(self.sticker_sources) > 2000:
+                    self.sticker_sources.popitem(last=False)
+            md5 = message.get('emoji_md5')
+            if not md5 or message.get('image_description'):
+                continue
+            note = self.sticker_notes.get(md5)
+            if note:
+                self._apply_sticker(message, note)
+            elif (message.get('id') in recent and md5 not in self.sticker_failed and md5 != self.sticker_busy
+                  and md5 not in self.sticker_queue and len(self.sticker_queue) < 30):
+                self.sticker_queue.append(md5)
+        self._pump_stickers()
+
+    def _pump_stickers(self):
+        if self.sticker_busy or not self.sticker_queue or self.closed:
+            return
+        cfg = self.store.full_config()
+        if not cfg.get('stickers_auto') or not cfg.get('api_key'):
+            self.sticker_queue.clear()
+            return
+        while self.sticker_queue:
+            md5 = self.sticker_queue.popleft()
+            info = self.sticker_sources.get(md5)
+            if info and not self.sticker_notes.get(md5):
+                break
+        else:
+            return
+        self.sticker_busy = md5
+        future = self.pool.submit(self._describe_sticker_task, cfg, md5, copy.deepcopy(info))
+        future.add_done_callback(lambda done: self._emit_sticker_done(md5, done))
+
+    def _sticker_data(self, md5, info):
+        with self.catalog_lock:
+            cached = self.sticker_bytes.get(md5)
+        if cached:
+            return cached
+        data, mime = fetch_sticker(info)
+        with self.catalog_lock:
+            self.sticker_bytes[md5] = (data, mime)
+            self.sticker_bytes.move_to_end(md5)
+            while len(self.sticker_bytes) > 40:
+                self.sticker_bytes.popitem(last=False)
+        return data, mime
+
+    def _describe_sticker_task(self, cfg, md5, info):
+        data, mime = self._sticker_data(md5, info)
+        result = self.models.submit('analyze_image', {
+            'data': data, 'mime_type': mime, 'config': {**cfg, 'media_allow_cloud': True},
+            'source': 'wechat_sticker', 'prompt': DESCRIBE_PROMPT}).result(timeout=120)
+        if not result.get('success') or not result.get('text'):
+            raise RuntimeError(result.get('warning') or '表情识别未完成。')
+        return result['text']
+
+    def _emit_sticker_done(self, md5, future):
+        if self.closed or future.cancelled():
+            return
+        try:
+            self.stickerDescribed.emit(md5, future.result(), None)
+        except Exception as exc:
+            self.stickerDescribed.emit(md5, None, self.safe_error(exc))
+
+    def _on_sticker_described(self, md5, text, error):
+        self.sticker_busy = None
+        if self.closed:
+            return
+        note = ''
+        if text and not error:
+            try:
+                note = self.sticker_notes.put(md5, text)
+            except OSError:
+                note = ''
+        if not note:
+            self.sticker_failed.add(md5)
+            if len(self.sticker_failed) > 500:
+                self.sticker_failed.clear()
+        else:
+            for session in self.sessions.values():
+                for message in session.get('messages', []):
+                    if message.get('emoji_md5') == md5 and not message.get('image_description'):
+                        self._apply_sticker(message, note)
+            self.emit()
+        self._pump_stickers()
+
+    def _media_bytes(self, config, sid, mid, asset_id=None):
+        with self.catalog_lock:
+            chosen = self.media_inputs.get(mid)
+        if chosen:
+            data, mime, kind = chosen
+            return {'status': 'ok', 'kind': kind, 'mime_type': mime, 'data': data, 'source': 'user_selected'}
+        sticker = next((m.get('emoji_md5') for m in self.sessions.get(sid, {}).get('messages', [])
+                        if m.get('id') == mid and m.get('emoji_md5')), None)
+        if sticker:
+            info = self.sticker_sources.get(sticker)
+            if not info:
+                return {'status': 'unavailable', 'reason': '这个表情没有可下载的地址。'}
+            try:
+                data, mime = self._sticker_data(sticker, info)
+            except RuntimeError as exc:
+                return {'status': 'unavailable', 'reason': str(exc)}
+            return {'status': 'ok', 'kind': 'image', 'mime_type': mime, 'data': data,
+                    'source': 'wechat_sticker', 'sticker': sticker}
+        if str(sid).startswith('import:'):
+            media = self.imports.resolve_media(sid, mid)
+            if media.get('status') != 'ok':
+                return {'status': 'unavailable', 'reason': media.get('reason', '媒体尚不可用')}
+            return {'status': 'ok', 'kind': media['kind'], 'mime_type': media['mime_type'],
+                    'data': media['data'], 'source': 'user_selected'}
+        if not asset_id:
+            for item in self.sessions.get(sid, {}).get('messages', []):
+                if item.get('id') == mid:
+                    asset_id = next((m.get('id') for m in item.get('media', []) if m.get('id')), None)
+                    break
+        if not asset_id:
+            session = self.sessions.get(sid, {})
+            kind = next((m.get('kind') for m in session.get('messages', []) if m.get('id') == mid), None)
+            if kind == 'image' and session.get('source') == 'wechat_db':
+                return {'status': 'unavailable', 'reason': '微信把聊天照片加密存放，ChatBot 读不到原图；可以在微信里另存后手动选择图片识别。'}
+            return {'status': 'unavailable', 'reason': '当前来源没有可读取的媒体文件；可从微信保存后手动选择。'}
+        resolved = self.hub.resolve_media({**config, 'source': 'weflow'}, asset_id)
+        if resolved.get('status') != 'available':
+            return {'status': 'unavailable', 'reason': resolved.get('reason', '媒体尚不可用')}
+        data_url = resolved.get('data_url') or ''
+        if len(data_url) > 28 * 1024 * 1024 or ';base64,' not in data_url:
+            return {'status': 'unavailable', 'reason': '媒体格式或体积不受支持。'}
+        try:
+            raw = base64.b64decode(data_url.split(';base64,', 1)[1], validate=True)
+        except (ValueError, base64.binascii.Error):
+            return {'status': 'unavailable', 'reason': '媒体数据无法解码。'}
+        return {'status': 'ok', 'kind': resolved['kind'], 'mime_type': resolved['mime_type'],
+                'data': raw, 'source': 'weflow_local'}
+
+    def _preview_media(self, config, sid, mid, asset_id=None):
+        result = self._media_bytes(config, sid, mid, asset_id)
+        if result['status'] != 'ok':
+            return {**result, 'available': False, 'success': False, 'message': result.get('reason')}
+        if result.get('source') == 'wechat_sticker' and len(result['data']) <= 1536 * 1024:
+            # 表情保持原样（含动图），已在下载时校验过格式。
+            payload, mime = result['data'], result['mime_type']
+        elif result['kind'] == 'image':
+            from io import BytesIO
+            from PIL import Image, ImageOps
+            try:
+                if len(result['data']) > 12 * 1024 * 1024:
+                    raise ValueError('too large')
+                with Image.open(BytesIO(result['data'])) as image:
+                    if image.width * image.height > 30_000_000:
+                        raise ValueError('too many pixels')
+                    image = ImageOps.exif_transpose(image)
+                    image.thumbnail((960, 960))
+                    canvas = Image.new('RGB', image.size, '#f6f8f7')
+                    canvas.paste(image.convert('RGB'))
+                    output = BytesIO()
+                    canvas.save(output, 'JPEG', quality=78, optimize=True)
+                    payload, mime = output.getvalue(), 'image/jpeg'
+            except (OSError, ValueError, Image.DecompressionBombError):
+                return {'status': 'unavailable', 'available': False, 'success': False,
+                        'reason': '此图片格式无法在本机预览。'}
+        elif result['kind'] == 'voice':
+            payload, mime = result['data'], result['mime_type']
+            if len(payload) > 12 * 1024 * 1024:
+                return {'status': 'unavailable', 'available': False, 'success': False,
+                        'reason': '语音文件过大，请先压缩或转写。'}
+        else:
+            return {'status': 'unavailable', 'available': False, 'success': False,
+                    'reason': '当前预览仅支持图片与语音。'}
+        return {'status': 'ok', 'available': True, 'success': True, 'kind': result['kind'], 'mime_type': mime,
+                'data_url': 'data:' + mime + ';base64,' + base64.b64encode(payload).decode('ascii')}
+
+    def _media_model_task(self, config, sid, mid, kind, asset_id=None, chosen=None):
+        if chosen:
+            source = 'user_selected'
+            data, mime = chosen
+        else:
+            media = self._media_bytes(config, sid, mid, asset_id)
+            if media['status'] != 'ok':
+                return {'success': False, 'available': False, 'status': 'unsupported',
+                        'message': media.get('reason', '媒体尚不可用')}
+            source, data, mime = media['source'], media['data'], media['mime_type']
+        cfg = {**config, 'media_allow_cloud': True}  # This call follows a user click.
+        task = 'analyze_image' if kind == 'image' else 'transcribe_audio'
+        payload = {'data': data, 'mime_type': mime, 'config': cfg, 'source': source}
+        if source == 'wechat_sticker':
+            payload['prompt'] = DESCRIBE_PROMPT
+        result = self.models.submit(task, payload).result(timeout=180)
+        if not result.get('success'):
+            return {'success': False, 'available': False, 'status': result.get('status'),
+                    'message': result.get('warning') or '模型无法处理所选媒体。'}
+        if not result.get('text'):
+            return {'success': False, 'available': False, 'status': 'empty',
+                    'message': result.get('warning') or '没有识别出可用内容。'}
+        if source == 'wechat_sticker' and not chosen:
+            note = self.sticker_notes.put(media['sticker'], result['text'])
+            if note:
+                return {'success': True, 'available': True, 'kind': 'image', 'text': note, 'description': note,
+                        'sticker': True, 'model': result.get('model'), 'warning': None, 'message': None}
+        return {'success': True, 'available': True, 'kind': kind, 'text': result.get('text', ''),
+                'description': result.get('text', '') if kind == 'image' else None,
+                'transcript': result.get('text', '') if kind == 'voice' else None,
+                'model': result.get('model'), 'warning': result.get('warning'),
+                'message': result.get('warning')}
+
+    def _analyze_moment_task(self, cfg, post, sid):
+        history = []
+        history_warning = ''
+        if sid:
+            if sid.startswith('import:'):
+                try:
+                    contact_scope = self.relationships.contact_for_session(sid)
+                    history = self.relationships.corpus(cid=contact_scope['id'], maximum=24, include_moments=False)['records']
+                    history_warning = '关系背景为跨时间抽样，包含私聊与共同群聊中的本人发言，未逐条送入模型。'
+                except ValueError:
+                    history = self.imports.messages(sid, limit=30).get('items', [])
+            else:
+                history = copy.deepcopy(self.sessions.get(sid, {}).get('messages', [])[-30:])
+                with self.catalog_lock:
+                    source = (self.catalog_items.get(sid) or self.sessions.get(sid) or {}).get('source')
+                if source in ('wechat_db', 'weflow') or (not history and sid.startswith('weflow:')):
+                    try:
+                        page = self._session_page_task({**cfg, 'source': source or 'weflow'}, sid, None, 30)
+                        history = page.get('items') or []
+                        if not page.get('available'):
+                            history_warning = '好友近期记录暂不可读取；分析仅使用可用历史快照。'
+                    except Exception:
+                        history = []
+                        history_warning = '好友聊天背景暂不可读取；建议仅基于本条动态。'
+        contact = next((entry for entry in self.store.contacts if post.get('author') in [entry['name'], *entry['aliases']]), None)
+        relationship = contact.get('relationship') if contact else cfg.get('relationship', '朋友')
+        details = {'id': post['id'], 'text': post.get('text', ''), 'author': post.get('author', ''),
+                   'image_descriptions': post.get('image_descriptions', [])}
+        image_assets = [item for item in post.get('media', []) if item.get('id') and item.get('kind') == 'image']
+        media_warning = history_warning
+        if image_assets and not details['image_descriptions']:
+            # The explicit Analyze action may use the first available picture.
+            resolved = self._media_bytes(cfg, sid or '', '', image_assets[0]['id'])
+            if resolved.get('status') == 'ok':
+                seen = self.models.submit('analyze_image', {'data': resolved['data'], 'mime_type': resolved['mime_type'],
+                     'config': {**cfg, 'media_allow_cloud': True}, 'source': resolved['source']}).result(timeout=180)
+                if seen.get('success') and seen.get('text'):
+                    details['image_descriptions'] = [seen['text']]
+                    if len(image_assets) > 1:
+                        media_warning += ' 只识别了第一张可用配图，其余配图未用于判断。'
+                else:
+                    media_warning += ' ' + (seen.get('warning') or '配图暂时无法识别，以下仅依据文字判断。')
+            else:
+                media_warning += ' ' + resolved.get('reason', '配图未能读取，以下仅依据文字判断。')
+        if not details['text'] and not details['image_descriptions']:
+            return {'available': False, 'message': '这条动态只有未能识别的配图，请先提供可用图片。'}
+        result = self.models.submit('analyze_moment', {'post': details, 'relationship': relationship or '朋友',
+                          'history': history, 'config': cfg}).result(timeout=180)
+        if sid and not history:
+            media_warning += ' 未取得这位好友的聊天历史，建议仅依据当前动态。'
+        if media_warning:
+            result['warning'] = (result.get('warning') or '') + ' ' + media_warning.strip()
+        like = result.get('like_recommendation')
+        return {**result, 'available': True, 'like': True if like == 'like' else False if like == 'skip' else None,
+                'recommendation': result.get('comment_label') or result.get('like_label'),
+                'reason': result.get('topic') or result.get('warning'),
+                'comments': [item['text'] for item in result.get('candidates', []) if item.get('text')]}
+
+    def snapshot(self):
+        current = copy.deepcopy(self.sessions.get(self.current_id))
+        if current:
+            current['active'] = ((current.get('source')=='wechat_db' and self.store.config['source']=='wechat_db')
+                                 or (self.current_id == self.live_id and self.status['capture'] == 'live'))
+        analysis=copy.deepcopy(self.results.get(self.current_id))
+        if analysis and current:
+            analysis['context_changed']=self.result_fingerprints.get(self.current_id)!=self.fingerprint(current)
+        session_list = [{'id': s['id'], 'title': s['title'], 'count': len(s.get('messages', [])),
+                         'preview': s.get('messages', [{}])[-1].get('text', '')[:100] if s.get('messages') else '',
+                         'updated': s.get('updated', 0), 'source': s.get('source', 'ocr'),
+                         'type': s.get('type', 'unknown'),
+                         'auto_reply_eligible': s.get('source') in ('weflow', 'wechat_db') or
+                                                (s.get('source') == 'ocr' and s['id'] == self.live_id and self.status['capture'] == 'live'),
+                         'auto_reply_type_known': s.get('source') in ('weflow', 'wechat_db') and s.get('type') in ('private', 'group')}
+                         for s in sorted(self.sessions.values(), key=lambda s: s.get('updated', 0), reverse=True)]
+        return {'config': self.store.public_config(), 'status': dict(self.status), 'sessions': session_list,
+                'current_session': current, 'analysis': analysis,
+                'notes': copy.deepcopy(self.store.notes), 'contacts': copy.deepcopy(self.store.contacts),
+                 'catalog': copy.deepcopy(self.catalog), 'moments': copy.deepcopy(self.moments),
+                 'appearance': self._appearance(), 'auto_reply': self._auto_public(),
+                'memory_count': self.memory.count(self.current_id) if self.current_id else 0,
+                'memory_auto': self.memory.auto,
+                'reply_history_count': self.reply_history.count(self.current_id) if self.current_id else 0,
+                'session_profile': self.profiles.get(self.current_id) if self.current_id else {},
+                'analysis_due_at': self.analysis_due.get(self.current_id),
+                'auto_analyze_selected': self.profiles.selected(),
+                'my_style': {'learned': bool(self.my_style.get('profile')), 'enabled': self.my_style.get('enabled', True) is not False,
+                             'sample_count': self.my_style.get('sample_count', 0), 'learned_at': self.my_style.get('learned_at'),
+                             'busy': self.style_busy},
+                'updates': copy.deepcopy(self.update_state),
+                'version': VERSION, 'capabilities': capabilities(), 'model_profile':profile_for(self.store.config.get('model_name'))}
+
+    def emit(self):
+        # Capture bursts share one snapshot/serialization per frame. Direct
+        # bootstrap requests still get the current state immediately.
+        if not self.closed and not self.state_timer.isActive():
+            self.state_timer.start()
+
+    def _publish_state(self):
+        if not self.closed:
+            self.stateChanged.emit(self.snapshot())
+
+    @staticmethod
+    def fingerprint(session):
+        # 表情识别只是给已有消息补注释，不算对话变化。
+        view = [{k: v for k, v in m.items() if k not in ('image_description', 'text')} if m.get('emoji_md5') else m
+                for m in session.get('messages', [])[-200:]]
+        raw = json.dumps(view, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def handle(self, method, params):
+        if self.closed:
+            raise RuntimeError('应用正在关闭。')
+        if method == 'check_updates':
+            return self.check_updates()
+        if method == 'open_update_release':
+            from .updates import REPOSITORY
+            state = self.update_state
+            url = str(state.get('url') or '')
+            if state.get('status') not in ('available', 'current') or not url.startswith(f'https://github.com/{REPOSITORY}/releases/tag/'):
+                raise ValueError('请先检查更新。')
+            QDesktopServices.openUrl(QUrl(url))
+            return {'success': True}
+        if method == 'list_relationship_contacts':
+            return self.pool.submit(self.relationships.contacts, params.get('query'), params.get('cursor'), params.get('limit', 24))
+        if method == 'contact_for_session':
+            return self.pool.submit(self.relationships.contact_for_session, str(params.get('session_id') or ''))
+        if method in ('history_statistics', 'analyze_history'):
+            cid, sid = params.get('contact_id'), params.get('session_id')
+            if not cid and not sid:
+                raise ValueError('请选择联系人或已索引会话。')
+            if method == 'history_statistics':
+                return self.pool.submit(self.relationships.statistics, cid, sid)
+            return self.pool.submit(self._history_analysis_task, cid, sid, self.store.full_config(), params.get('question', ''))
+        if method == 'sync_analysis_archive':
+            sid = str(params.get('session_id') or '')
+            with self.catalog_lock:
+                meta = copy.deepcopy(self.catalog_items.get(sid) or self.sessions.get(sid))
+            return self.pool.submit(self._sync_analysis_task, sid, meta, params.get('restart') is True)
+        if method == 'sync_native_moments':
+            return self.pool.submit(self._sync_native_moments, params.get('cursor'))
+        if method == 'import_moments':
+            cid = str(params.get('contact_id') or '')
+            contact = self.relationships.contact(cid)
+            files, _ = QFileDialog.getOpenFileNames(None, '选择朋友圈 JSON（id、username、contentDesc、createTime）', '', '朋友圈 JSON (*.json)')
+            if not files:
+                return {'cancelled': True}
+            return self.pool.submit(self.relationships.import_moments, files, contact['owner'], contact['platform'])
+        if method == 'list_personas':
+            return self.pool.submit(self.relationships.personas, params.get('cursor'), params.get('limit', 24))
+        if method == 'create_persona':
+            return self.pool.submit(self.relationships.create_persona, params.get('contact_id'), params.get('name', ''),
+                params.get('mode', 'companion'), params.get('include_groups', True) is True, params.get('include_moments', True) is True)
+        if method == 'get_persona':
+            return self.pool.submit(self.relationships.persona, params.get('id'))
+        if method == 'persona_memories':
+            return self.pool.submit(self.relationships.memories, params.get('id'), params.get('cursor'), params.get('limit', 24))
+        if method == 'set_persona_memory':
+            return self.pool.submit(self.relationships.set_memory, params.get('id'), params.get('memory_id'), params.get('active'))
+        if method == 'delete_persona':
+            return self.pool.submit(self.relationships.delete_persona, params.get('id'))
+        if method == 'chat_persona':
+            return self.pool.submit(self._persona_chat_task, str(params.get('id') or ''), params.get('text'), self.store.full_config())
+        if method == 'list_actions':
+            return self.pool.submit(self.actions.list, params.get('state', 'open'), params.get('cursor') or 0, params.get('limit', 30))
+        if method == 'create_action':
+            sid = str(params.get('session_id') or '')
+            session = copy.deepcopy(self.sessions.get(sid))
+            if not session:
+                raise ValueError('请先打开需要跟进的会话。')
+            return self.pool.submit(self.actions.create, params.get('action') or {}, session)
+        if method == 'extract_followups':
+            session = copy.deepcopy(self.sessions.get(str(params.get('session_id') or '')))
+            if not session:
+                raise ValueError('请先选择客户会话。')
+            cfg = self.store.full_config()
+            cfg = {k: cfg[k] for k in ('base_url', 'model_name', 'api_key', 'reply_model', 'reply_base_url', 'reply_api_key', 'style')}
+            return self.models.submit('extract_followups', {'messages': session.get('messages') or [], 'config': cfg})
+        if method == 'update_action':
+            return self.pool.submit(self.actions.transition, params.get('id'), params.get('state'), params.get('revision'))
+        if method == 'search_messages':
+            return self.pool.submit(self.imports.search, params.get('query'), params.get('cursor') or 0, params.get('limit', 20))
+        if method == 'select_search_result':
+            sid, mid = str(params.get('session_id') or ''), str(params.get('message_id') or '')
+            self.current_id = sid
+            self.follow_live = False
+            def load():
+                meta = self.imports.get_session(sid)
+                if not meta:
+                    raise ValueError('导入会话不存在，请重新检索。')
+                page = self.imports.context(sid, mid)
+                return {'session': {**meta, 'messages': page['items'], 'next_cursor': page['next_cursor'],
+                                    'has_more': page['has_more'], 'highlight_message_id': mid}, 'page': page}
+            future = self.pool.submit(load)
+            future.add_done_callback(lambda done: self._emit_session_done(sid, 'select', done))
+            return future
+        if method == 'speak_text':
+            if self.speech is None:
+                from .speech import Speech
+                self.speech = Speech()
+            return self.speech.say(params.get('text'))
+        if method == 'stop_speech':
+            if self.speech:
+                self.speech.stop()
+            return {'success': True}
+        if method == 'bootstrap':
+            return self.snapshot()
+        if method == 'configure_auto_reply':
+            return self._configure_auto(params)
+        if method == 'start_auto_reply':
+            return self._start_auto(params)
+        if method == 'pause_auto_reply':
+            return self._stop_auto(pause=True)
+        if method == 'stop_auto_reply':
+            return self._stop_auto(emergency=bool(params.get('emergency')))
+        if method == 'catch_up_auto_reply':
+            return self._catch_up_once(params)
+        if method == 'run_agent':
+            raw = params.get('session_ids')
+            if not isinstance(raw, list) or not 1 <= len(raw) <= 3:
+                raise ValueError('请从会话目录选择 1 至 3 个会话。')
+            ids = [str(value) for value in raw]
+            if any(not value or len(value) > 256 for value in ids) or len(set(ids)) != len(ids):
+                raise ValueError('会话选择无效，请重新选择。')
+            if not self.store.secrets['api_key']:
+                raise ValueError('请先在设置中填写模型 API Key。')
+            with self.catalog_lock:
+                catalog = {sid: copy.deepcopy(self.catalog_items.get(sid)) for sid in ids}
+            selected = []
+            for sid in ids:
+                session = copy.deepcopy(self.sessions.get(sid) or catalog.get(sid))
+                if not session:
+                    raise ValueError('会话目录已更新，请重新选择需要巡检的会话。')
+                selected.append((sid, session))
+            source_config = self.store.full_config()
+            model_keys = ('api_key', 'base_url', 'model_name', 'reply_api_key', 'reply_base_url',
+                          'reply_model', 'relationship', 'style', 'context_limit', 'timeout')
+            model_config = {key: source_config[key] for key in model_keys if key in source_config}
+            return self.pool.submit(self._run_agent_task, source_config, model_config, selected)
+        if method == 'work_agent_create':
+            return {'session': self.work_agent.create_session()}
+        if method == 'work_agent_list':
+            return {'sessions': self.work_agent.list_sessions()}
+        if method == 'work_agent_load':
+            return {'session': self.work_agent.get_session(str(params.get('session_id') or ''))}
+        if method == 'work_agent_attach':
+            sid = str(params.get('session_id') or '')
+            self.work_agent.get_session(sid)
+            files, _ = QFileDialog.getOpenFileNames(None, '选择 Work Agent 材料', '',
+                '支持的文件 (*.txt *.md *.csv *.json *.py *.js *.ts *.html *.css *.xml *.pdf *.docx *.xlsx *.pptx *.png *.jpg *.jpeg *.webp);;所有文件 (*)')
+            if not files:
+                return {'cancelled': True, 'attachments': []}
+            if len(files) > 8:
+                raise ValueError('一次最多添加 8 个文件。')
+            future = self.pool.submit(self._work_attach_task, sid, files)
+            return future
+        if method == 'work_agent_turn':
+            sid = str(params.get('session_id') or '')
+            text = str(params.get('text') or '').strip()
+            ids = params.get('attachment_ids') or []
+            if not isinstance(ids, list) or len(ids) > 8 or any(not isinstance(value, str) or len(value) > 128 for value in ids):
+                raise ValueError('附件选择无效。')
+            if len(set(ids)) != len(ids) or len(text) > 12000 or (not text and not ids):
+                raise ValueError('请输入任务内容或选择材料，文字最多 12000 字。')
+            self.work_agent.get_session(sid)
+            config = self._work_model_config()
+            with self.work_agent_lock:
+                if sid in self.work_agent_busy:
+                    raise ValueError('这个任务正在处理上一条消息，请稍候。')
+                self.work_agent_busy.add(sid)
+            try:
+                future = self.pool.submit(self._work_turn_task, sid, text, ids, config)
+            except Exception:
+                with self.work_agent_lock:
+                    self.work_agent_busy.discard(sid)
+                raise
+            def release(_):
+                with self.work_agent_lock:
+                    self.work_agent_busy.discard(sid)
+                    self.work_agent_cancelled.discard(sid)
+                    self.work_agent_jobs.pop(sid, None)
+                    self.work_agent_phases.pop(sid, None)
+            future.add_done_callback(release)
+            return future
+        if method == 'work_agent_cancel':
+            sid = str(params.get('session_id') or '')
+            with self.work_agent_lock:
+                if sid not in self.work_agent_busy:
+                    return {'success': False, 'message': '这个任务当前没有正在运行的回合。'}
+                if self.work_agent_phases.get(sid) in ('saving', 'done'):
+                    return {'success': False, 'message': '结果已进入保存阶段，无法中途停止。'}
+                self.work_agent_cancelled.add(sid)
+                job = self.work_agent_jobs.get(sid)
+            if job:
+                self.models.cancel(job)
+            self._work_phase(sid, 'stopping')
+            return {'success': True}
+        if method == 'work_agent_test':
+            return self.pool.submit(self._work_test_task, self._work_model_config(params.get('config')))
+        if method == 'work_agent_export':
+            sid = str(params.get('session_id') or '')
+            path = self.work_agent.resolve_artifact(sid, str(params.get('artifact_id') or ''))
+            target, _ = QFileDialog.getSaveFileName(None, '导出 Work Agent 成果', path.name, '所有文件 (*)')
+            if not target:
+                return {'cancelled': True}
+            return self.pool.submit(self._work_export_task, path, Path(target))
+        if method == 'work_agent_preview':
+            sid = str(params.get('session_id') or '')
+            artifact_id = str(params.get('artifact_id') or '')
+            path = self.work_agent.resolve_artifact(sid, artifact_id)
+            artifact = next((a for a in self.work_agent.get_session(sid)['artifacts'] if a['id'] == artifact_id), None)
+            if path.stat().st_size > 100000:
+                raise ValueError('成果文件超过预览大小限制，请导出后查看。')
+            try:
+                content = path.read_text(encoding='utf-8')
+            except (OSError, UnicodeError):
+                raise ValueError('暂时无法预览该成果文件。') from None
+            return {'name': artifact['name'] if artifact else '成果文件', 'text': content[:100000]}
+        if method == 'work_agent_delete':
+            sid = str(params.get('session_id') or '')
+            with self.work_agent_lock:
+                if sid in self.work_agent_busy:
+                    raise ValueError('任务仍在运行，请完成后再删除。')
+            self.work_agent.delete_session(sid)
+            return {'success': True}
+        if method == 'list_sessions':
+            config = self.store.full_config()
+            # The worker must not iterate mutable Qt-owned session state.
+            collected = copy.deepcopy(list(self.sessions.values())) if params.get('source') == 'collected' else None
+            return self.pool.submit(self._list_sessions_task, config, params.get('query', ''),
+                                    params.get('cursor'), params.get('limit', 20), params.get('source', 'all'), collected)
+        if method == 'list_moments':
+            config = self.store.full_config()
+            return self.pool.submit(self._list_moments_task, config, params.get('session_id'),
+                                    params.get('cursor'), min(50, max(1, int(params.get('limit') or 20))))
+        if method == 'manual_moment':
+            author = str(params.get('author') or '').strip()[:200]
+            content = str(params.get('text') or '').strip()[:16000]
+            if not author or not content:
+                raise ValueError('请填写好友名称和动态内容。')
+            sid = str(params.get('session_id') or '')[:256]
+            item = {'id': 'manual-moment:' + uuid.uuid4().hex, 'author': author, 'username': '',
+                    'session_id': sid or None, 'text': content, 'timestamp': time.time(),
+                    'media': [], 'source': 'manual'}
+            owner, platform = '', 'wechat'
+            if sid.startswith('import:'):
+                try:
+                    contact = self.relationships.contact_for_session(sid)
+                    item['username'], owner, platform = contact['username'], contact['owner'], contact['platform']
+                except ValueError:
+                    pass
+            item = self.relationships.save_moment(item, owner=owner, platform=platform)
+            with self.catalog_lock:
+                self.manual_moments[item['id']] = item
+                self.moment_posts[item['id']] = item
+                while len(self.manual_moments) > 200:
+                    self.manual_moments.popitem(last=False)
+            self.emit()
+            return {'success': True, 'available': True, 'item': item}
+        if method == 'analyze_moment':
+            ident = str(params.get('moment_id') or '')[:256]
+            with self.catalog_lock:
+                post = copy.deepcopy(self.moment_posts.get(ident))
+            if not post:
+                post = self.relationships.get_moment(ident)
+            if not post:
+                raise ValueError('这条动态已过期，请刷新后再分析。')
+            sid = str(params.get('session_id') or post.get('session_id') or '')[:256]
+            if not self.store.secrets['api_key']:
+                raise ValueError('请先在设置中填写模型 API Key。')
+            return self.pool.submit(self._analyze_moment_task, self.store.full_config(), post, sid)
+        if method == 'import_chat_records':
+            mode = params.get('mode') or 'files'
+            if mode == 'folder':
+                directory = QFileDialog.getExistingDirectory(None, '选择 ChatLab 导出目录')
+                if not directory:
+                    return {'cancelled': True}
+                root = Path(directory)
+                future = self.pool.submit(self._import_folder_task, root)
+                future.add_done_callback(lambda done: self._emit_import_done(done))
+                return future
+            elif mode == 'files':
+                files, _ = QFileDialog.getOpenFileNames(None, '选择 ChatLab JSON/JSONL', '', 'ChatLab 文件 (*.json *.jsonl)')
+            else:
+                raise ValueError('导入方式无效。')
+            if not files:
+                if mode == 'folder':
+                    raise ValueError('目录中没有可识别的 ChatLab JSON/JSONL 文件。')
+                return {'cancelled': True}
+            future = self.pool.submit(self.imports.import_files, files,
+                    lambda progress: self.dataEvent.emit('import_progress', progress))
+            future.add_done_callback(lambda done: self._emit_import_done(done))
+            return future
+        if method == 'load_session_messages':
+            sid = str(params.get('session_id') or '')[:256]
+            if not sid:
+                raise ValueError('请选择一个会话。')
+            future = self.pool.submit(self._load_page, self.store.full_config(), sid,
+                                      params.get('cursor'), min(100, max(1, int(params.get('limit') or 30))))
+            future.add_done_callback(lambda done: self._emit_session_done(sid, 'older', done))
+            return future
+        if method == 'load_media':
+            sid, mid = str(params.get('session_id') or ''), str(params.get('message_id') or '')
+            return self.pool.submit(self._preview_media, self.store.full_config(), sid, mid,
+                                    params.get('asset_id'))
+        if method in ('analyze_image', 'transcribe_voice'):
+            sid, mid = str(params.get('session_id') or ''), str(params.get('message_id') or '')
+            if not sid or not mid:
+                raise ValueError('需要明确的会话与消息。')
+            kind = 'image' if method == 'analyze_image' else 'voice'
+            future = self.pool.submit(self._media_model_task, self.store.full_config(), sid, mid,
+                                      kind, params.get('asset_id'))
+            future.add_done_callback(lambda done: self._emit_media_done(sid, mid, done))
+            return future
+        if method == 'choose_media':
+            sid = str(params.get('session_id') or self.current_id or '')
+            if not sid or sid not in self.sessions:
+                raise ValueError('请先选择需要补充的会话。')
+            kind = params.get('kind')
+            if kind not in ('image', 'voice'):
+                raise ValueError('仅支持选择图片或语音文件。')
+            file_filter = '图片 (*.png *.jpg *.jpeg *.webp *.gif)' if kind == 'image' else '语音 (*.wav *.mp3 *.m4a *.ogg *.opus *.flac)'
+            filename, _ = QFileDialog.getOpenFileName(None, '选择需要理解的本机媒体', '', file_filter)
+            if not filename:
+                return {'cancelled': True}
+            from mimetypes import guess_type
+            path = Path(filename)
+            limit = 8 * 1024 * 1024 if kind == 'image' else 20 * 1024 * 1024
+            if path.stat().st_size > limit:
+                raise ValueError('媒体文件过大，请缩小后再试。')
+            mime = guess_type(path.name)[0] or 'application/octet-stream'
+            data = path.read_bytes()
+            mid = 'manual-media:' + uuid.uuid4().hex
+            with self.catalog_lock:
+                self.media_inputs[mid] = (data, mime, kind)
+                self.media_inputs.move_to_end(mid)
+                while len(self.media_inputs) > 10:
+                    self.media_inputs.popitem(last=False)
+            session = self.sessions[sid]
+            session['messages'].append({'id': mid, 'side': 'other', 'sender': '手动提供',
+                         'kind': kind, 'text': '[图片]' if kind == 'image' else '[语音]',
+                         'timestamp': time.time(), 'source': 'manual_media', 'media': []})
+            self.emit()
+            future = self.pool.submit(self._media_model_task, self.store.full_config(), sid, mid,
+                                      kind, None, (data, mime))
+            future.add_done_callback(lambda done: self._emit_media_done(sid, mid, done))
+            return future
+        if method == 'set_appearance':
+            config = {}
+            for key in ('motion', 'intro_enabled', 'background_dim'):
+                if key in params:
+                    config[key] = params[key]
+            if 'theme' in params:
+                config['theme'] = params['theme']
+            if 'font_scale' in params:
+                config['font_scale'] = params['font_scale']
+            self.store.save_config(config)
+            self.emit()
+            return {'success': True, 'appearance': self._appearance()}
+        if method == 'choose_background':
+            filename, _ = QFileDialog.getOpenFileName(None, '选择 ChatBot 背景图片', '', '图片 (*.png *.jpg *.jpeg *.webp)')
+            if not filename:
+                return {'cancelled': True, 'appearance': self._appearance()}
+            from PIL import Image, ImageOps
+            from io import BytesIO
+            path = Path(filename)
+            if path.stat().st_size > 15 * 1024 * 1024:
+                raise ValueError('背景图片超过 15 MB，请先缩小。')
+            try:
+                with Image.open(path) as image:
+                    if image.width * image.height > 30_000_000:
+                        raise ValueError('背景图片像素过大。')
+                    image = ImageOps.exif_transpose(image)
+                    image.thumbnail((1920, 1200))
+                    canvas = image.convert('RGB')
+                    for quality in (75, 62, 50):
+                        output = BytesIO()
+                        canvas.save(output, 'JPEG', quality=quality, optimize=True)
+                        data = output.getvalue()
+                        if len(data) <= 1024 * 1024:
+                            break
+                        canvas.thumbnail((int(canvas.width * .8), int(canvas.height * .8)))
+                    if len(data) > 1024 * 1024:
+                        raise ValueError('背景图片无法压缩至安全大小，请选择另一张。')
+            except (OSError, Image.DecompressionBombError):
+                raise ValueError('无法读取此图片，请选择 PNG、JPEG 或 WebP。') from None
+            target = self.store.directory / 'background.jpg'
+            temporary = target.with_suffix('.jpg.tmp')
+            temporary.write_bytes(data)
+            os.replace(temporary, target)
+            self.background_url = self._background_url()
+            self.emit()
+            return {'success': True, 'appearance': self._appearance()}
+        if method == 'clear_background':
+            (self.store.directory / 'background.jpg').unlink(missing_ok=True)
+            self.background_url = ''
+            self.emit()
+            return {'success': True, 'appearance': self._appearance()}
+        if method == 'save_config':
+            if self.auto_policy['enabled']:
+                self._stop_auto()
+            self.store.save_config(params.get('config', {}))
+            self.capture.configure(self.store.full_config())
+            self.revision += 1
+            self.windowAction.emit('always_on_top', self.store.config['always_on_top'])
+            self.emit()
+            return self.store.public_config()
+        if method == 'test_connection':
+            return self.models.submit('test_connection', self.store.merged(params.get('config', {})))
+        if method == 'start_capture':
+            self.paused_by_user = False
+            self.allow_initial = True
+            self.capture.start(self.store.full_config())
+            self.status.update(capture='searching', detail='正在定位微信窗口…', last_error='')
+            self.emit()
+            return {'success': True}
+        if method == 'pause_capture':
+            if self.auto_policy['enabled']:
+                self._stop_auto(pause=True)
+            self.paused_by_user = True
+            self.capture.pause()
+            self.revision += 1
+            self.timer.stop()
+            self.pending = None
+            self.status.update(capture='paused', analysis='idle', connected=False, detail='采集已暂停')
+            self.emit()
+            return {'success': True}
+        if method == 'one_shot':
+            self.paused_by_user = False
+            self.allow_initial = True
+            self.capture.one_shot(self.store.full_config())
+            return {'success': True}
+        if method == 'refresh_sources':
+            return self.pool.submit(self.capture.sources, self.store.full_config())
+        if method == 'select_session':
+            ident = params.get('session_id')
+            if ident not in self.sessions:
+                future = self.pool.submit(self._session_first_page, self.store.full_config(), str(ident or '')[:256])
+                future.add_done_callback(lambda done: self._emit_session_done(str(ident or ''), 'select', done))
+                return future
+            self.current_id = ident
+            self.follow_live = ident == self.live_id
+            self.emit()
+            return self.snapshot()
+        if method == 'load_week_context':
+            sid=str(params.get('session_id') or self.current_id or '')
+            session=copy.deepcopy(self.sessions.get(sid))
+            if not session:raise ValueError('请先选择一个会话。')
+            future=self.pool.submit(self._week_session_task,session,self.store.full_config())
+            future.add_done_callback(lambda done:self._emit_session_done(sid,'select',done))
+            return future
+        if method == 'analyze':
+            ident = params.get('session_id') or self.current_id
+            if not ident or not self.sessions.get(ident, {}).get('messages'):
+                raise ValueError('还没有可分析的消息。')
+            if not self.store.secrets['api_key']:
+                raise ValueError('请先在设置中填写 API Key。')
+            self.pending = ident
+            self.pending_manual = True
+            self._run_pending()
+            return {'success': True}
+        if method.startswith('memory_') or method.startswith('reply_history') or method == 'fill_history_reply':
+            return self._memory_and_history(method, params)
+        if method.startswith('session_profile') or method.startswith('style_'):
+            return self._profile_and_style(method, params)
+        if method == 'regenerate_replies':
+            ident = params.get('session_id') or self.current_id
+            session = self.sessions.get(ident) or {}
+            if not ident or not session.get('messages'):
+                raise ValueError('还没有可分析的消息。')
+            if not self.store.secrets['api_key']:
+                raise ValueError('请先在设置中填写 API Key。')
+            last = self.results.get(ident) or {}
+            fingerprint = self.fingerprint(session)
+            same = bool(last) and self.result_fingerprints.get(ident) == fingerprint
+            answers = last.get('answers') if same and last.get('judgment_available') is not False and last.get('answers') else None
+            self.regen_requests[ident] = {
+                'instruction': str(params.get('instruction') or '').strip()[:200],
+                'previous': [c.get('text') for c in last.get('candidates', []) if isinstance(c, dict) and c.get('text')][:5],
+                'answers': answers, 'fingerprint': fingerprint}
+            self.pending = ident
+            self.pending_manual = True
+            self._run_pending()
+            return {'success': True, 'reuse_judgment': bool(answers)}
+        if method == 'copy_reply':
+            QApplication.clipboard().setText(str(params.get('text', ''))[:16000])
+            return {'success': True}
+        if method == 'fill_reply':
+            ident = params.get('session_id')
+            session = self.sessions.get(ident)
+            native=bool(session and session.get('source')=='wechat_db' and self.store.config['source']=='wechat_db')
+            if not native and (ident != self.live_id or self.status['capture'] != 'live'):
+                raise ValueError('当前微信会话与候选所属会话不一致，请切回原会话。')
+            result = self.results.get(ident, {})
+            candidates = result.get('candidates', [])
+            index = int(params.get('index', -1))
+            if not 0 <= index < len(candidates):
+                raise ValueError('候选回复不存在。')
+            if 'text' in params and params['text']!=candidates[index]['text']:
+                raise ValueError('这条建议已被新一轮分析替换，请重新选择要填入的内容。')
+            if native:
+                return self.pool.submit(self.capture.fill_db,candidates[index]['text'],ident,session['title'])
+            return self.pool.submit(self.capture.fill, candidates[index]['text'], session['title'])
+        if method == 'save_note':
+            result = self.store.save_note(params.get('note', {}))
+        elif method == 'save_contact':
+            result = self.store.save_contact(params.get('contact', {}))
+        elif method in ('delete_note', 'delete_contact'):
+            self.store.delete('notes' if method == 'delete_note' else 'contacts', params.get('id'))
+            result = {'success': True}
+        elif method == 'import_notes':
+            blocks = str(params.get('text', '')).replace('\r\n', '\n').split('\n\n')
+            count = 0
+            for block in blocks[:100]:
+                lines = block.strip().splitlines()
+                if lines:
+                    self.store.save_note({'title': lines[0], 'content': '\n'.join(lines[1:]) or lines[0]})
+                    count += 1
+            result = {'success': True, 'count': count}
+        elif method == 'clear_history':
+            self._stop_auto()
+            self.revision += 1
+            self.sessions.clear()
+            self.results.clear()
+            self.result_fingerprints.clear()
+            self.media_inputs.clear()
+            self.store.clear_history()
+            self.capture.reset_history()
+            self.current_id = self.live_id = None
+            self.follow_live = True
+            self.timer.stop()
+            self.pending = None
+            result = {'success': True}
+        elif method == 'manual_context':
+            title = str(params.get('title', '')).strip()[:100] or '手动分析'
+            text = str(params.get('text', '')).strip()[:32000]
+            if not text:
+                raise ValueError('请粘贴需要分析的对话。')
+            ident = 'manual:' + hashlib.sha256(title.encode()).hexdigest()[:16]
+            messages = []
+            for index, line in enumerate(text.splitlines()):
+                line = line.strip()
+                if not line:
+                    continue
+                mine = line.startswith(('我：', '我:', 'me:', 'me：'))
+                for prefix in ('我：', '我:', 'me:', 'me：', '对方：', '对方:', 'other:'):
+                    if line.startswith(prefix):
+                        line = line[len(prefix):].strip()
+                        break
+                messages.append({'id': f'{time.time_ns()}:{index}', 'text': line, 'side': 'me' if mine else 'other',
+                                 'sender': '我' if mine else '对方', 'timestamp': time.time(), 'source': 'manual'})
+            self.sessions[ident] = {'id': ident, 'title': title, 'messages': messages, 'source': 'manual', 'updated': time.time()}
+            self.current_id = ident
+            self.follow_live = False
+            result = {'success': True, 'session_id': ident}
+        elif method == 'set_compact':
+            self.windowAction.emit('compact', bool(params.get('enabled')))
+            result = {'success': True}
+        elif method == 'open_data_folder':
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.directory.resolve()))):
+                raise RuntimeError('无法打开数据目录，请检查系统文件管理器。')
+            result = {'success': True}
+        elif method == 'quit':
+            self.windowAction.emit('quit', True)
+            result = {'success': True}
+        else:
+            raise ValueError('此操作暂不支持。')
+        self.emit()
+        return result
+
+    def _emit_import_done(self, future):
+        if self.closed or future.cancelled():
+            return
+        try:
+            self.importFinished.emit(future.result(), None)
+        except Exception as exc:
+            self.importFinished.emit(None, self.safe_error(exc))
+
+    def _on_import_finished(self, result, error):
+        if self.closed:
+            return
+        self.catalog['progress'] = None
+        if result and result.get('success'):
+            self.catalog['imported'] = self.imports.count()
+            self.catalog['available'] = True
+            self.catalog['scope'] = 'imported_archive'
+            self._sync_hub()
+            try:
+                self.pool.submit(self.imports.warm_search)
+            except RuntimeError:
+                pass
+        self.emit()
+
+    def _emit_session_done(self, sid, kind, future):
+        if self.closed or future.cancelled():
+            return
+        try:
+            self.sessionLoaded.emit(sid, {'kind': kind, 'result': future.result()}, None)
+        except Exception as exc:
+            self.sessionLoaded.emit(sid, None, self.safe_error(exc))
+
+    def _on_session_loaded(self, sid, payload, error):
+        if self.closed or error or not payload:
+            return
+        result = payload['result']
+        if payload['kind'] == 'select':
+            session = result['session']
+            if (session.get('context_window') or {}).get('days')==7:
+                # Keep events received while the background history read ran.
+                existing=self.sessions.get(sid,{}).get('messages',[])
+                messages,meta=select_week([*session['messages'],*existing],time.time(),
+                    complete=session['context_window'].get('complete',False),source=session.get('source','ocr'))
+                session.update(messages=messages,context_window=meta)
+            elif (session.get('context_window') or {}).get('mode') == 'latest':
+                # 近 7 天不足时读的「最近 200 条」：同样保留读取期间新到的消息。
+                existing = self.sessions.get(sid, {}).get('messages', [])
+                session['messages'] = self._merge_latest(session['messages'], existing)
+                session['context_window'] = {**session['context_window'], 'message_count': len(session['messages'])}
+            self.sessions[sid] = session
+            self._absorb_stickers(sid, session.get('messages', []))
+            self.current_id = sid
+            self.follow_live = False
+            # Explicitly generated drafts remain available when more history
+            # or a new message arrives. Snapshot marks them for user review.
+        else:
+            session = self.sessions.get(sid)
+            if session:
+                combined = {m['id']: m for m in [*result.get('items', []), *session.get('messages', [])] if m.get('id')}
+                # Pages are requested explicitly. Never silently discard an older
+                # page while the user is traversing a large archive.
+                session['messages'] = sorted(combined.values(), key=lambda m: (m.get('timestamp') or 0, m['id']))
+                self._absorb_stickers(sid, session['messages'])
+                session['next_cursor'] = result.get('next_cursor')
+                session['has_more'] = bool(result.get('has_more'))
+        self._sync_hub()
+        self.emit()
+
+    def _emit_media_done(self, sid, mid, future):
+        if self.closed or future.cancelled():
+            return
+        try:
+            self.mediaFinished.emit(sid, mid, future.result(), None)
+        except Exception as exc:
+            self.mediaFinished.emit(sid, mid, None, self.safe_error(exc))
+
+    def _on_media_finished(self, sid, mid, result, error):
+        if self.closed or error or not result or not result.get('success'):
+            return
+        if sid.startswith('import:') and result.get('text'):
+            try:
+                self.imports.save_understanding(sid, mid, result['text'], result.get('kind'), result.get('model'))
+            except ValueError:
+                self.toast.emit('原始媒体消息已改变，识别结果未保存到历史索引。', 'info')
+        session = self.sessions.get(sid)
+        if not session:
+            return
+        for message in session.get('messages', []):
+            if message.get('id') != mid:
+                continue
+            if result.get('kind') == 'voice' and result.get('transcript'):
+                message['transcript'] = result['transcript']
+                message['text'] = '[语音转写] ' + result['transcript']
+            elif result.get('sticker') and result.get('description'):
+                self._apply_sticker(message, result['description'])
+            elif result.get('kind') == 'image' and result.get('description'):
+                message['image_description'] = result['description']
+                message['text'] = '[图片识别] ' + result['description']
+            break
+        else:
+            return
+        if self.store.config['auto_analyze'] and sid == self.live_id and session['messages'][-1]['id'] == mid:
+            self.pending = sid
+            self.pending_manual = True
+            self.timer.start(400)
+        self._sync_hub()
+        self.emit()
+
+    def _on_data(self, kind, data):
+        if self.closed:
+            return
+        if kind == 'sessions_updated':
+            items = data.get('items') or []
+            self._remember_catalog(items)
+            indexed = {entry['id']: entry for entry in self.catalog['preview_updates']}
+            for item in items:
+                indexed[item['id']] = item
+            self.catalog['preview_updates'] = list(indexed.values())[-100:]
+            self.catalog['source'] = data.get('source') or self.catalog['source']
+        elif kind == 'catalog_meta':
+            self.catalog.update({name: value for name, value in data.items() if value is not None})
+            self.catalog['imported'] = self.imports.count()
+        elif kind == 'import_progress':
+            self.catalog['progress'] = data
+        elif kind == 'moments_meta':
+            self.moments.update(data)
+        self.emit()
+
+    def _on_capture(self, kind, data):
+        if self.closed:
+            return
+        if self.paused_by_user and not (kind == 'status' and data.get('capture') == 'paused'):
+            return
+        if kind == 'status':
+            self.status.update({k: v for k, v in data.items() if k in ('capture', 'detail', 'source')})
+            self.status['connected'] = self.status['capture'] == 'live'
+            if self.status['capture'] == 'error':
+                self.status['last_error'] = self.safe_error(data.get('detail') or '采集未完成。')
+                if self.auto_policy['enabled']:
+                    # 瞬时读取失败只作废在途任务，采集恢复 live 后自动继续；不再永久暂停。
+                    self._cancel_auto_work()
+                    self.auto_detail = '微信采集暂时中断，已取消在途回复；恢复后自动继续监听。'
+            elif self.status['capture'] == 'live':
+                self.status['last_error'] = ''
+        elif kind == 'error':
+            self.status.update(capture='error', connected=False, last_error=data.get('message', '采集失败'))
+            if self.auto_policy['enabled']:
+                self._cancel_auto_work()
+                self.auto_paused = True
+                self.auto_detail = '微信消息状态发生变化，自动回复已暂停。'
+        elif kind in ('session', 'messages'):
+            ident = data.get('session_id') or data.get('id')
+            if not ident:
+                self.live_id = None
+                self.emit()
+                return
+            is_live = data.get('source') != 'manual'
+            if is_live:
+                previous = self.live_id
+                self.live_id = ident
+                # A deliberate archive selection stays put when the visible
+                # WeChat window changes in the background.
+                if self.current_id is None or self.follow_live:
+                    self.current_id = ident
+            session = self.sessions.setdefault(ident, {'id': ident, 'title': data.get('title', '当前会话'),
+                                                        'source': data.get('source', 'ocr'), 'messages': [], 'updated': time.time()})
+            session['title'] = data.get('title') or session['title']
+            if data.get('type') in ('private', 'group'):
+                session['type'] = data['type']
+            if data.get('talker'):
+                session['talker'] = data['talker']
+            if kind == 'messages':
+                historical = bool(data.get('historical', False))
+                initial_allowed = self.allow_initial
+                self.allow_initial = False
+                # A missing bubble overlap alone is ambiguous: scrolling old
+                # records can look like fresh messages. The selected sidebar
+                # preview changes only when that chat receives a new latest
+                # message. Require that change plus a verified visible tail;
+                # otherwise quarantine this batch and keep listening.
+                if historical and session['messages'] and data.get('source') == 'ocr' and not initial_allowed:
+                    if self.auto_policy['enabled'] and ident in self.auto_policy['session_ids']:
+                        self._cancel_auto_work()
+                        if data.get('sidebar_changed') is True and data.get('tail_baseline_verified') is True:
+                            baseline = []
+                            for row in data.get('messages', []):
+                                message = dict(row)
+                                message['text'] = str(message.get('text') or '')[:16000]
+                                message['historical'] = True
+                                baseline.append(message)
+                            if baseline:
+                                session['messages'] = baseline[-500:]
+                                session['updated'] = time.time()
+                                self.store.save_history([s for s in self.sessions.values() if s.get('source') != 'import'])
+                                self.auto_detail = '左侧摘要已更新且聊天尾部可核验，已重建当前屏上下文。'
+                                last = session['messages'][-1]
+                                if (data.get('tail_verified') is True and last.get('side') == 'other' and
+                                        self.store.secrets['api_key'] and not self.auto_paused):
+                                    last['historical'] = False
+                                    live_event = {**data, 'historical': False}
+                                    delay = self._auto_observe(session, last, live_event)
+                                    if delay is not None:
+                                        self.pending = ident
+                                        self.pending_manual = False
+                                        self.timer.start(max(self.store.config['debounce_ms'], delay))
+                        else:
+                            self.auto_detail = '当前屏与最新摘要无法共同确认新来信，本批跳过并继续监听。'
+                        self._save_auto_state()
+                    self.status.update(capture='live', connected=True, last_error='')
+                    self._sync_hub()
+                    self.emit()
+                    return
+                known = {m['id'] for m in session['messages']}
+                added = []
+                for message in data.get('messages', []):
+                    message = dict(message)
+                    message.setdefault('id', hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest())
+                    if message['id'] in known:
+                        continue
+                    message['text'] = str(message.get('text', ''))[:16000]
+                    known.add(message['id'])
+                    added.append(message)
+                combined=session['messages']+added
+                if (session.get('context_window') or {}).get('days')==7:
+                    messages,meta=select_week(combined,time.time(),
+                        complete=session['context_window'].get('complete',False),source=session.get('source','ocr'))
+                    session.update(messages=messages,context_window=meta)
+                else:
+                    session['messages']=combined[-500:]
+                    if (session.get('context_window') or {}).get('mode') == 'latest':
+                        session['context_window'] = {**session['context_window'], 'message_count': len(session['messages'])}
+                if data.get('source') in ('weflow', 'wechat_db'):
+                    session['messages'].sort(key=lambda m: m.get('timestamp') or 0)
+                if added:
+                    self._absorb_stickers(ident, added)
+                session['updated'] = time.time()
+                # Imported archives already live in their own local index. Avoid
+                # copying them into the optional transient history JSON as well.
+                self.store.save_history([s for s in self.sessions.values() if s.get('source') != 'import'])
+                cfg = self.store.full_config()
+                if added and added[-1].get('side') == 'me':
+                    # 我自己回了：取消这个会话正在等的自动分析和自动回复。
+                    self.analysis_due.pop(ident, None)
+                    if self.auto_trigger and self.auto_trigger['session_id'] == ident:
+                        self.auto_trigger = None
+                        self._auto_log(ident, 'skipped', '你已自己回复，取消这次自动回复')
+                    if self.pending == ident and not self.pending_manual:
+                        self.pending = None
+                        self.timer.stop()
+                auto_delay = None
+                if added and added[-1].get('side') == 'other' and cfg['api_key'] and not historical:
+                    auto_delay = self._auto_observe(session, added[-1], data)
+                    if auto_delay is None and self.auto_trigger and self.auto_trigger['session_id'] == ident:
+                        self.auto_trigger = None
+                if added and added[-1].get('side') == 'other' and cfg['api_key']:
+                    if auto_delay is not None:
+                        # 自动回复占用唯一的分析槽；普通自动分析排在到期队列里，不会顶掉它。
+                        self.analysis_due.pop(ident, None)
+                        self.pending = ident
+                        self.pending_manual = False
+                        self.timer.start(max(cfg['debounce_ms'], auto_delay))
+                    elif (not historical or initial_allowed) and self._auto_analyze_allowed(ident, cfg):
+                        self._schedule_auto_analysis(ident, session, cfg)
+            self.status.update(capture='live', connected=True, last_error='')
+            self._sync_hub()
+        self.emit()
+
+    # ---- 自动分析的时机 ----------------------------------------------------------
+    def _auto_analyze_allowed(self, ident, cfg):
+        if not cfg.get('auto_analyze'):
+            return False
+        return cfg.get('auto_analyze_scope') != 'selected' or ident in self.profiles.auto_sessions()
+
+    def _schedule_auto_analysis(self, ident, session, cfg):
+        """对方来消息后：攒够 N 条就马上分析；否则等我 X 秒，没回再分析（从第一条没回的消息起算）。"""
+        unanswered = 0
+        for message in reversed(session.get('messages') or []):
+            if message.get('side') == 'me':
+                break
+            if message.get('side') == 'other':
+                unanswered += 1
+        now = time.time()
+        need, wait = int(cfg.get('auto_analyze_count') or 0), int(cfg.get('auto_analyze_wait') or 0)
+        if (need and unanswered >= need) or not wait:
+            self.analysis_due[ident] = now + cfg['debounce_ms'] / 1000  # 等对方说完（每条新消息顺延）
+        else:
+            self.analysis_due.setdefault(ident, now + wait)
+        timer = getattr(self, 'due_timer', None)
+        if timer is not None and not getattr(self, 'closed', False) and not timer.isActive():
+            timer.start()
+
+    def _check_due_analysis(self):
+        if self.closed or not self.analysis_due:
+            self.due_timer.stop()
+            return
+        if self.inflight or self.pending:
+            return
+        ident, due = min(self.analysis_due.items(), key=lambda item: item[1])
+        if due > time.time():
+            return
+        self.analysis_due.pop(ident, None)
+        session = self.sessions.get(ident)
+        if not session or not session.get('messages') or session['messages'][-1].get('side') != 'other':
+            return
+        if ident in self.results and self.result_fingerprints.get(ident) == self.fingerprint(session):
+            return
+        self.pending = ident
+        self.pending_manual = False
+        self._run_pending()
+
+    def _run_pending(self):
+        if self.inflight or not self.pending or self.closed:
+            return
+        if (self.auto_trigger and not self.pending_manual and
+                self.auto_trigger['session_id'] == self.pending):
+            remaining = self.auto_trigger['ready_at'] - time.time()
+            if remaining > 0:
+                self.timer.start(max(50, int(remaining * 1000)))
+                return
+        ident, self.pending = self.pending, None
+        manual, self.pending_manual = self.pending_manual, False
+        session = copy.deepcopy(self.sessions.get(ident))
+        cfg = self.store.full_config()
+        if not session or not session['messages'] or not cfg['api_key']:
+            return
+        if not manual and session['messages'][-1].get('side') != 'other':
+            return
+        fingerprint = self.fingerprint(session)
+        self.auto_running_trigger = None
+        if (not manual and self.auto_trigger and self.auto_trigger['session_id'] == ident and
+                self.auto_trigger['message']['id'] == session['messages'][-1].get('id') and
+                self.auto_trigger['epoch'] == self.auto_epoch and self.auto_policy['enabled'] and not self.auto_paused):
+            self.auto_running_trigger = self.auto_trigger
+            self.auto_trigger = None
+        background, contact = self.store.background(session['title'], session['messages'])
+        if self.auto_running_trigger:
+            # Unattended replies use only this conversation. Private notes and
+            # contact metadata must not be copied into an outgoing draft.
+            background, contact = '', None
+            cfg['style'] = (str(cfg.get('style') or '')[:2000] +
+                            '\n自动回复请用不超过130字的自然短句，只回答当前消息；不编造事实、承诺或私聊之外的背景。'
+                            '不要添加来源署名或固定后缀。')
+            if self.auto_running_trigger.get('type') == 'group':
+                # 群聊是公开场合：禁止替用户编造第一人称经历，并点名回应提问者。
+                asker = (self.auto_running_trigger['message'].get('sender_name')
+                         or self.auto_running_trigger['message'].get('sender') or '')
+                cfg['style'] += ('\n这是群聊，回复会公开显示。只依据群里已经出现的信息作答，'
+                                 '不得以第一人称陈述个人经历、使用情况（包括“我试过/没试过/我用过”）、状态、行程或承诺；'
+                                 '缺少依据时坦率说不确定，或建议查看文档、请其他群友补充。'
+                                 + (f'开头用“{asker[:20]}”称呼提问者，' if asker and not asker.startswith('wxid_') else '')
+                                 + '不要使用 @ 符号。')
+        if contact and contact.get('relationship'):
+            cfg['relationship'] = contact['relationship']
+        # 记忆：手动分析带上「关于对方 + 关于我」；无人值守的自动回复只带这位联系人自己的记忆。
+        remembered = self.memory.context(ident, include_self=not self.auto_running_trigger)
+        if remembered:
+            background = (str(background or '') + '\n\n' + remembered).strip()
+        # 这个会话的聊天目的与补充背景：用户专为这位联系人写的，手动和自动回复都带上。
+        profile_text = self.profiles.context_text(ident)
+        if profile_text:
+            background = (str(background or '') + '\n\n' + profile_text).strip()
+        style_text = style_prompt(self.my_style)
+        if style_text:
+            cfg['style'] = (str(cfg.get('style') or '') + '\n' + style_text).strip()
+        regen = self.regen_requests.pop(ident, None) if manual else None
+        previous = None
+        if regen:
+            extra = '\n用户对上一批回复不满意，请重新写五条：换不同的说法和角度，不要只改几个字。'
+            if regen['instruction']:
+                extra += '这次的要求（优先满足）：' + regen['instruction']
+            if regen['previous']:
+                extra += '\n上一批（不要重复这些句子，也不要换汤不换药）：' + json.dumps(regen['previous'], ensure_ascii=False)
+            cfg['style'] = (str(cfg.get('style') or '') + extra).strip()
+            if regen.get('answers') and regen.get('fingerprint') == fingerprint:
+                previous = {'answers': regen['answers']}
+        self.job_serial += 1
+        serial, revision = self.job_serial, self.revision
+        self.inflight = (ident, serial)
+        self.status.update(analysis='running', last_error='')
+        self.emit()
+        history = session['messages'][:-cfg['context_limit']][-30:] if cfg['save_history'] else None
+        try:
+            analysis_payload = {'messages': session['messages'], 'config': cfg,
+                        'background': background, 'history': history, 'reply_to': cfg.get('reply_to') or None}
+            if previous:
+                analysis_payload['previous'] = previous
+            if self.auto_running_trigger:
+                future = self.pool.submit(self._prepare_live_auto_task, cfg, session, analysis_payload,
+                                          copy.deepcopy(self.auto_running_trigger), self.auto_policy['group_mode'])
+            else:
+                if cfg.get('context_days') == 7:
+                    future=self.pool.submit(self._analysis_with_week_context,analysis_payload,session,cfg)
+                else:
+                    future = self.models.submit('analyze', analysis_payload)
+        except Exception as exc:
+            self.inflight = None
+            self.status.update(analysis='error', last_error=self.safe_error(exc))
+            if self.auto_running_trigger:
+                self.auto_running_trigger = None
+                self.auto_paused = True
+                self.auto_detail = '实时判断任务未能启动，自动回复已暂停。'
+                self._auto_record(ident, 'failed', '实时判断任务启动失败')
+            self.emit()
+            return
+        def work(completed):
+            if self.closed or completed.cancelled():
+                return
+            try:
+                result = completed.result()
+                result['session_id'] = ident
+                result['updated_at'] = time.time()
+                self.analysisDone.emit(ident, revision, fingerprint, result, None)
+            except Exception as exc:
+                self.analysisDone.emit(ident, revision, fingerprint, None, self.safe_error(exc))
+        future.add_done_callback(work)
+
+    @staticmethod
+    def _merge_latest(loaded, existing):
+        merged = {m.get('id') or (m.get('timestamp'), m.get('side'), m.get('text')): m for m in [*loaded, *existing]}
+        return sorted(merged.values(), key=lambda m: (timestamp(m.get('timestamp')) or 0))[-500:]
+
+    def _week_session_task(self, session, cfg):
+        messages,meta=read_week_context(session,cfg,self._session_page_task,self._wechat_db_reader)
+        return {'session':{**session,'messages':messages,'context_window':meta,
+                           'has_more':False,'next_cursor':None}}
+
+    def _note_stickers(self, messages):
+        """线程安全：只用已缓存的表情描述改写文字，不排队、不联网。"""
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            info = message.pop('emoji', None)
+            md5 = (info or {}).get('md5') or message.get('emoji_md5')
+            if md5:
+                message['emoji_md5'] = md5
+                note = self.sticker_notes.get(md5)
+                if note:
+                    self._apply_sticker(message, note)
+        return messages
+
+    def _analysis_with_week_context(self,payload,session,cfg):
+        messages,meta=read_week_context(session,cfg,self._session_page_task,self._wechat_db_reader)
+        self._note_stickers(messages)
+        payload={**payload,'messages':messages,'history':None,'context_meta':meta}
+        return self.models.submit('analyze',payload).result(timeout=305 if profile_for(cfg.get('model_name')) else 180)
+
+    def _on_analysis(self, ident, revision, fingerprint, result, error):
+        self.inflight = None
+        auto_trigger, self.auto_running_trigger = self.auto_running_trigger, None
+        if self.closed:
+            return
+        if revision == self.revision and ident in self.sessions:
+            if error:
+                self.status.update(analysis='error', last_error=error)
+                self.toast.emit(error, 'error')
+                if auto_trigger:
+                    # 模型超时/限流多为瞬时问题：计入连续失败，3 次才暂停。
+                    self.auto_failures += 1
+                    self._auto_record(ident, 'failed', '模型分析失败：' + str(error)[:80])
+                    if self.auto_failures >= 3:
+                        self.auto_paused = True
+                        self.auto_detail = '模型分析已连续 3 次失败，自动回复已暂停。'
+                    else:
+                        self.auto_detail = f'模型分析失败（连续 {self.auto_failures}/3），继续监听。'
+            elif self.fingerprint(self.sessions[ident]) == fingerprint or not auto_trigger:
+                self.status.update(analysis='idle', last_error='')
+                if auto_trigger:
+                    judged = result.pop('_auto_decision', None) if isinstance(result, dict) else None
+                    self.results.pop(ident, None)
+                    self.result_fingerprints.pop(ident, None)
+                    if not isinstance(judged, dict):
+                        self.auto_paused = True
+                        self.auto_detail = '实时回复判断结果缺失，自动回复已暂停。'
+                        self._auto_record(ident, 'failed', '模型实时回复判断缺失')
+                    elif judged.get('reason') == 'provider_or_protocol_failure':
+                        self.auto_paused = True
+                        self.auto_detail = '模型实时回复判断服务暂不可用，自动回复已暂停。'
+                        self._auto_record(ident, 'failed', '模型实时回复判断服务不可用')
+                    elif judged.get('should_reply') is not True or judged.get('target_message_id') != auto_trigger['message']['id']:
+                        # 区分"模型判断无需回复"与本地前置规则拒绝，避免误导。
+                        reason = SKIP_REASONS.get(judged.get('reason'), '模型判断当前来信不需要回复')
+                        self._auto_record(ident, 'skipped', reason)
+                        self.auto_detail = reason + '，继续等待。'
+                    else:
+                        self.results[ident] = result
+                        self.result_fingerprints[ident] = fingerprint
+                        self._remember_result(ident, result, auto=True)
+                        self._auto_dispatch(auto_trigger, result, judged)
+                else:
+                    self.results[ident] = result
+                    self.result_fingerprints[ident] = fingerprint
+                    self._remember_result(ident, result)
+            else:
+                self.status['analysis'] = 'idle'
+                if ((self.store.config['auto_analyze'] or self.auto_policy['enabled']) and self.status['capture'] == 'live'
+                        and self.sessions[ident]['messages'][-1].get('side') == 'other'):
+                    self.pending = ident
+                    self.pending_manual = False
+        else:
+            self.status['analysis'] = 'idle'
+        self.emit()
+        if self.pending:
+            self.timer.start(400)
+
+    def _memory_and_history(self, method, params):
+        sid = str(params.get('session_id') or '')[:256]
+        title = (self.sessions.get(sid) or {}).get('title', '')
+        if method == 'memory_view':
+            if not sid:
+                raise ValueError('请先选择一个会话。')
+            return {**self.memory.view(sid, title), 'profile': self.profiles.get(sid),
+                    'auto_analyze_scope': self.store.config.get('auto_analyze_scope', 'all'),
+                    'auto_analyze': bool(self.store.config.get('auto_analyze'))}
+        if method == 'memory_overview':
+            return self.memory.overview()
+        if method == 'memory_add':
+            if sid != MEMORY_SELF and sid not in self.sessions and not self.memory.count(sid):
+                raise ValueError('会话已不在列表中，请重新打开后再记。')
+            item = self.memory.add(sid, params.get('text'), title)
+            self.emit()
+            return {'success': True, 'item': item}
+        if method == 'memory_update':
+            item = self.memory.update(str(params.get('id') or ''), params.get('text'))
+            return {'success': True, 'item': item}
+        if method == 'memory_delete':
+            self.memory.delete(str(params.get('id') or ''))
+            self.emit()
+            return {'success': True}
+        if method == 'memory_auto':
+            enabled = self.memory.set_auto(bool(params.get('enabled')))
+            self.emit()
+            return {'success': True, 'auto': enabled}
+        if method == 'reply_history':
+            return {'items': self.reply_history.items(sid), 'title': title}
+        if method == 'reply_history_clear':
+            self.reply_history.clear(sid)
+            self.emit()
+            return {'success': True}
+        if method == 'fill_history_reply':
+            session = self.sessions.get(sid)
+            if not session:
+                raise ValueError('请先打开这个会话。')
+            text = self.reply_history.text(sid, str(params.get('entry_id') or ''), int(params.get('index', -1)))
+            if session.get('source') == 'wechat_db' and self.store.config['source'] == 'wechat_db':
+                return self.pool.submit(self.capture.fill_db, text, sid, session['title'])
+            if sid != self.live_id or self.status['capture'] != 'live':
+                raise ValueError('当前微信会话与这条回复所属会话不一致，请切回原会话。')
+            return self.pool.submit(self.capture.fill, text, session['title'])
+        raise ValueError('不支持的操作。')
+
+    def _profile_and_style(self, method, params):
+        if method == 'session_profile_save':
+            sid = str(params.get('session_id') or '')[:256]
+            if sid not in self.sessions and not any(p['session_id'] == sid for p in self.profiles.selected()):
+                raise ValueError('会话已不在列表中，请重新打开后再设置。')
+            fields = {k: params[k] for k in ('goal', 'context', 'auto_analyze') if k in params}
+            profile = self.profiles.update(sid, (self.sessions.get(sid) or {}).get('title', ''), **fields)
+            if 'auto_analyze' in fields and not profile['auto_analyze']:
+                self.analysis_due.pop(sid, None)
+            self.emit()
+            return {'success': True, 'profile': profile}
+        if method == 'style_get':
+            return {'profile': self.my_style.get('profile', ''), 'examples': self.my_style.get('examples', []),
+                    'enabled': self.my_style.get('enabled', True) is not False,
+                    'sample_count': self.my_style.get('sample_count', 0), 'learned_at': self.my_style.get('learned_at')}
+        if method == 'style_save':
+            if not self.my_style.get('profile') and not str(params.get('profile') or '').strip():
+                raise ValueError('还没有学习过你的说话方式。')
+            record = dict(self.my_style)
+            if 'profile' in params:
+                text = str(params.get('profile') or '').strip()[:1200]
+                if not text:
+                    raise ValueError('说话方式不能为空；不想用可以关掉开关。')
+                record['profile'] = text
+            if 'enabled' in params:
+                record['enabled'] = bool(params.get('enabled'))
+            _atomic(self.style_file, record)
+            self.my_style = record
+            self.emit()
+            return {'success': True}
+        if method == 'style_clear':
+            self.style_file.unlink(missing_ok=True)
+            self.my_style = {}
+            self.emit()
+            return {'success': True}
+        if method == 'style_learn':
+            if self.style_busy:
+                raise ValueError('正在学习，请稍等。')
+            if not self.store.secrets['api_key']:
+                raise ValueError('请先在设置中填写模型 API Key。')
+            self.style_busy = True
+            self.emit()
+            future = self.pool.submit(self._learn_style_task, self.store.full_config())
+            future.add_done_callback(lambda done: self.dataEvent.emit('style_learned', {}))
+            return future
+        raise ValueError('不支持的操作。')
+
+    def _my_message_samples(self, limit=400, per_session=25):
+        """收集我自己发过的文字消息（不含对方的话），优先最近活跃的私聊。"""
+        samples, group = [], 0
+
+        def take(messages):
+            nonlocal group
+            picked = []
+            for message in messages:
+                text = str(message.get('text') or '').strip()
+                if (message.get('side') == 'me' and message.get('kind', 'text') == 'text' and 2 <= len(text) <= 60
+                        and 'http' not in text and not text.startswith(('<', '[')) and text not in picked):
+                    picked.append(text)
+            if picked:
+                group += 1
+                samples.extend({'group': group, 'text': text} for text in picked[-per_session:])
+
+        if self.store.config['source'] == 'wechat_db':
+            source = self._wechat_db_reader()
+            heads = source.latest_session_heads(limit=80)
+            ordered = sorted(heads, key=lambda h: str(h.get('id', '')).endswith('@chatroom'))
+            for head in ordered:
+                talker = str(head.get('id') or '')
+                if not talker or talker.startswith(('gh_', 'wxdb:')) or talker in ('filehelper', 'weixin'):
+                    continue
+                take(sorted(source.messages(talker, limit=200), key=lambda m: m.get('timestamp') or 0))
+                if len(samples) >= limit:
+                    break
+        else:
+            for session in list(self.sessions.values()):
+                take(session.get('messages', []))
+                if len(samples) >= limit:
+                    break
+        return samples[:limit]
+
+    def _learn_style_task(self, cfg):
+        try:
+            samples = self._my_message_samples()
+            result = self.models.submit('learn_style', {'samples': samples, 'config': cfg}).result(timeout=150)
+            record = {'profile': result['profile'], 'examples': result.get('examples', []), 'enabled': True,
+                      'sample_count': result.get('sample_count', len(samples)), 'learned_at': time.time()}
+            _atomic(self.style_file, record)
+            self.my_style = record
+            return {'success': True, 'sample_count': record['sample_count']}
+        finally:
+            self.style_busy = False
+
+    def _remember_result(self, ident, result, auto=False):
+        """把这一轮的回复建议记进「之前的回复」，并收下模型提出的新记忆。"""
+        session = self.sessions.get(ident) or {}
+        if not isinstance(result, dict) or session.get('source') == 'manual':
+            return
+        title = session.get('title') or ''
+        incoming = next((m for m in reversed(session.get('messages', [])) if m.get('side') == 'other'), {})
+        try:
+            self.reply_history.record(ident, title, incoming.get('text', ''), result.get('candidates'),
+                                      result.get('best_index'), auto=auto)
+            added = self.memory.merge_auto(ident, title, result.get('memory_candidates'))
+        except OSError:
+            return
+        if added and ident == self.current_id:
+            first = added[0]['text']
+            self.toast.emit(f'记住了：{first}' + (f'（共 {len(added)} 条）' if len(added) > 1 else ''), 'info')
+
+    def check_updates(self):
+        if self.update_busy:
+            return dict(self.update_state)
+        from .updates import check_updates
+        self.update_busy = True
+        self.update_state = {**self.update_state, 'checking': True}
+        future = self.pool.submit(check_updates, VERSION)
+        def done(result):
+            try:
+                state = result.result()
+            except Exception:
+                state = {'status': 'error', 'message': '暂时无法检查更新，请稍后重试。'}
+            if not self.closed:
+                self.updateChecked.emit(state)
+        future.add_done_callback(done)
+        return future
+
+    def _on_update_checked(self, state):
+        if self.closed:
+            return
+        self.update_busy = False
+        self.update_state = dict(state)
+        if state.get('status') == 'available' and state.get('version') != self.update_notified:
+            self.update_notified = state['version']
+            self.toast.emit(state['message'] + ' 在设置底部点击“发现新版本”。', 'info')
+        self.emit()
+
+    def safe_error(self, exc):
+        message = str(exc) or '操作未完成，请稍后重试。'
+        for value in self.store.secrets.values():
+            if value:
+                message = message.replace(value, '[已隐藏]')
+        return message[:1200]
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.state_timer.stop()
+        if self.speech:
+            self.speech.stop()
+        self.timer.stop()
+        self.due_timer.stop()
+        try:
+            self.capture.stop(wait=False)
+        finally:
+            self.hub.close(wait=False)
+            self.models.close()
+            self.pool.close()

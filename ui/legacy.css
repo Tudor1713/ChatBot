@@ -1,0 +1,7 @@
+/* Preserve mature interaction geometry below the new design system. */
+@import url("styles.css") layer(legacy);
+@import url("refinement.css") layer(legacy);
+@import url("experience.css") layer(legacy);
+@import url("workbench.css") layer(legacy);
+@import url("relationships.css") layer(legacy);
+@import url("polish.css") layer(legacy);

@@ -1,0 +1,33 @@
+# PyInstaller onedir: offline OCR models, QtWebEngine, and local UI travel together.
+from PyInstaller.utils.hooks import collect_all
+from pathlib import Path
+import sys
+
+root = Path(SPECPATH)
+datas = [(str(root / 'ui'), 'ui'), (str(root / 'THIRD_PARTY_NOTICES.md'), '.')]
+binaries, hiddenimports = [], []
+for module in ('rapidocr_onnxruntime', 'sqlcipher3', 'zstandard', *(['windows_capture'] if sys.platform == 'win32' else ['keyring'] if sys.platform == 'darwin' else [])):
+    d, b, h = collect_all(module)
+    datas += d
+    binaries += b
+    hiddenimports += h
+a = Analysis([str(root / 'src/main.py')], pathex=[str(root / 'src')],
+             binaries=binaries, datas=datas, hiddenimports=hiddenimports,
+             hookspath=[], runtime_hooks=[], excludes=['tkinter', 'matplotlib', 'scipy', 'IPython', 'pandas'],
+             noarchive=False)
+# Qt's Windows build imports the OS ICU ABI (un-suffixed functions). An ICU
+# from tools such as Poppler on PATH exports suffixed symbols and breaks Qt.
+# Supported Windows versions provide the required system ICU themselves.
+a.binaries = [entry for entry in a.binaries if Path(entry[0]).name.lower() not in {'icuuc.dll', 'icudt78.dll'}]
+pyz = PYZ(a.pure)
+exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='ChatBot', debug=False,
+          bootloader_ignore_signals=False, strip=False, upx=False, console=False,
+          version=str(root / 'scripts/windows_version.txt') if sys.platform == 'win32' else None,
+          icon=str(root / 'ui/icon.ico'))
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='ChatBot')
+if sys.platform == 'darwin':
+    from runpy import run_path
+    VERSION = run_path(str(root / 'src/desk/version.py'))['VERSION']
+    app = BUNDLE(coll, name='ChatBot.app', icon=str(root / 'ui/icon.ico'), bundle_identifier='ai.chatbot.desktop',
+                 info_plist={'CFBundleShortVersionString': VERSION, 'CFBundleVersion': VERSION,
+                             'LSMinimumSystemVersion': '13.0', 'NSHighResolutionCapable': True})

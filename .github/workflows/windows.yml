@@ -1,0 +1,172 @@
+name: Desktop checks and release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/PROJECT_MEMORY.md'
+      - 'docs/VALIDATION-*.md'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: Publish as a preview (normal clients only notify for stable releases)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+            python: .venv/Scripts/python.exe
+          - os: macos-14
+            platform: macOS
+            python: .venv/bin/python
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Prepare macOS SQLCipher
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install sqlcipher
+          echo "LDFLAGS=-L$(brew --prefix sqlcipher)/lib" >> "$GITHUB_ENV"
+          echo "CPPFLAGS=-I$(brew --prefix sqlcipher)/include -I$(brew --prefix sqlcipher)/include/sqlcipher" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$(brew --prefix sqlcipher)/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: Install dependencies and verified font
+        shell: bash
+        run: |
+          python -m venv .venv
+          "${{ matrix.python }}" -m pip install --disable-pip-version-check -r requirements-lock.txt
+          "${{ matrix.python }}" scripts/fetch_font.py
+      - name: Check source privacy and syntax
+        shell: bash
+        run: |
+          "${{ matrix.python }}" scripts/check_secrets.py --tree . --history
+          "${{ matrix.python }}" -m compileall -q src scripts
+          node --check ui/app.js
+          node --check ui/experience.js
+          node --check ui/workbench.js
+          node --check ui/relationships.js
+      - name: Test pull requests
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: '"${{ matrix.python }}" -m unittest discover -s tests -v'
+      - name: Build Windows portable app
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build.ps1
+      - name: Build macOS app
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/build_macos.sh
+      - name: Exercise synthetic UI workflows
+        shell: bash
+        run: '"${{ matrix.python }}" scripts/smoke_chatbot.py --output work/chatbot-ui'
+      - name: Validate Windows packaged runtime
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $report = Join-Path $PWD 'work/portable-selftest.json'
+          $p = Start-Process ./outputs/build/ChatBot/ChatBot.exe -ArgumentList '--self-test-report', $report -PassThru -WindowStyle Hidden
+          if (-not $p.WaitForExit(60000)) { throw 'Portable self-test timed out.' }
+          if ($p.ExitCode -ne 0 -or -not (Get-Content $report -Raw | ConvertFrom-Json).success) { throw 'Portable self-test failed.' }
+          $version = ./.venv/Scripts/python.exe -c "import sys;sys.path.insert(0,'src');from desk.version import VERSION;print(VERSION)"
+          ./.venv/Scripts/python.exe scripts/package_portable.py --input outputs/build/ChatBot --output "outputs/ChatBot-$version-Windows.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'Distribution privacy check failed.' }
+      - name: Validate macOS packaged runtime
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          outputs/build/ChatBot.app/Contents/MacOS/ChatBot --self-test-report work/macos-selftest.json
+          "${{ matrix.python }}" -c "import json; assert json.load(open('work/macos-selftest.json'))['success']"
+      - name: Upload verified release candidates
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: |
+            outputs/*.zip
+            outputs/SHA256SUMS
+            outputs/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+  release:
+    needs: desktop
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: desktop-*
+          path: outputs
+          merge-multiple: true
+      - name: Publish only after both platform gates pass
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            const fs = require('fs'), path = require('path');
+            const version = fs.readFileSync('src/desk/version.py','utf8').match(/VERSION\s*=\s*['"](\d+\.\d+\.\d+)['"]/)[1];
+            const tag = `v${version}`, {owner,repo} = context.repo;
+            const preview = '${{ inputs.prerelease }}' === 'true';
+            const latest=(await github.rest.repos.getBranch({owner,repo,branch:'main'})).data.commit.sha;
+            if (latest !== context.sha) { core.info('A newer source revision supersedes this candidate.'); return; }
+            const files = fs.readdirSync('outputs').filter(f=>f.endsWith('.zip') || f.endsWith('.sha256') || f === 'SHA256SUMS');
+            if (!files.some(f=>f.includes('-Windows.zip')) || !files.some(f=>f.includes('-macOS-') && f.endsWith('.zip'))) throw new Error('Both desktop archives are required');
+            const crypto = require('crypto'), checksums = new Map();
+            for (const file of files.filter(f=>f.endsWith('.sha256') || f === 'SHA256SUMS')) {
+              for (const line of fs.readFileSync(path.join('outputs',file),'utf8').trim().split(/\r?\n/)) {
+                const match=line.match(/^([a-f0-9]{64})\s+([^/\\]+\.zip)$/);
+                if (!match) throw new Error('Invalid checksum manifest');
+                checksums.set(match[2],match[1]);
+              }
+            }
+            for (const file of files.filter(f=>f.endsWith('.zip'))) {
+              const hash=crypto.createHash('sha256').update(fs.readFileSync(path.join('outputs',file))).digest('hex');
+              if (checksums.get(file) !== hash) throw new Error('Archive checksum verification failed');
+            }
+            const body = fs.readFileSync(`docs/releases/${version}.md`,'utf8');
+            let release;
+            try {
+              release=(await github.rest.repos.getReleaseByTag({owner,repo,tag})).data;
+              if (!release.draft) { core.info('This version is already published; immutable assets are preserved.'); return; }
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              release=(await github.rest.repos.createRelease({owner,repo,tag_name:tag,target_commitish:context.sha,name:`ChatBot ${tag}${preview ? ' 预览版' : ''}`,body,draft:true,prerelease:preview})).data;
+            }
+            const assets=(await github.rest.repos.listReleaseAssets({owner,repo,release_id:release.id})).data;
+            for (const name of files) {
+              const old=assets.find(a=>a.name===name);
+              if (old) await github.rest.repos.deleteReleaseAsset({owner,repo,asset_id:old.id});
+              const data=fs.readFileSync(path.join('outputs',name));
+              await github.rest.repos.uploadReleaseAsset({owner,repo,release_id:release.id,name,data,headers:{'content-type':name.endsWith('.zip')?'application/zip':'text/plain','content-length':data.length},request:{timeout:600000}});
+            }
+            const finalHead=(await github.rest.repos.getBranch({owner,repo,branch:'main'})).data.commit.sha;
+            if (finalHead !== context.sha) { core.info('Source changed during upload; keep this release as a draft.'); return; }
+            await github.rest.repos.updateRelease({owner,repo,release_id:release.id,body,draft:false,prerelease:preview});

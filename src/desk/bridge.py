@@ -1,0 +1,54 @@
+from concurrent.futures import Future
+import json
+from PySide6.QtCore import QObject, Signal, Slot
+
+
+class Bridge(QObject):
+    response = Signal(str)
+    event = Signal(str)
+
+    def __init__(self, controller):
+        super().__init__()
+        self.controller = controller
+        controller.stateChanged.connect(lambda data: self.publish('state', data))
+        controller.toast.connect(lambda message, level: self.publish('toast', {'message': message, 'level': level}))
+        controller.workAgentProgress.connect(lambda sid, phase: self.publish('work_agent_progress',
+            {'session_id': sid, 'phase': phase}))
+
+    def publish(self, kind, data):
+        self.event.emit(json.dumps({'type': kind, 'data': data}, ensure_ascii=False))
+
+    def reply(self, ident, data=None, error=None):
+        self.response.emit(json.dumps({'id': ident, 'ok': error is None, 'data': data, 'error': error}, ensure_ascii=False))
+
+    @Slot(str)
+    def request(self, raw):
+        ident = None
+        try:
+            if len(raw) > 300000:
+                raise ValueError('请求内容过长。')
+            packet = json.loads(raw)
+            if not isinstance(packet, dict):
+                raise ValueError('请求格式无效。')
+            ident = packet.get('id')
+            if not isinstance(ident, (str, int)) or isinstance(ident, bool) or len(str(ident)) > 128:
+                ident = None
+                raise ValueError('请求标识无效。')
+            method = packet.get('method')
+            if not isinstance(method, str) or not method or len(method) > 100:
+                raise ValueError('请求方法无效。')
+            params = packet.get('params', {})
+            if not isinstance(params, dict):
+                raise ValueError('请求参数格式无效。')
+            result = self.controller.handle(method, params)
+            if isinstance(result, Future):
+                def done(future):
+                    try:
+                        self.reply(ident, future.result())
+                    except Exception as exc:
+                        self.reply(ident, error=self.controller.safe_error(exc))
+                result.add_done_callback(done)
+            else:
+                self.reply(ident, result)
+        except Exception as exc:
+            self.reply(ident, error=self.controller.safe_error(exc))

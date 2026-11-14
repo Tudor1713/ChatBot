@@ -1,0 +1,936 @@
+'use strict';
+
+/* Offline presentation and optional data-source features. All content is textContent. */
+window.ChatBotExperience = Object.freeze({
+  mount(api) {
+    const { $, el, append, icon, button, iconButton, notice, empty, heading, tag, rpc, sync, setState, getState, getPage, go, render, toast, errorText, formatTime, valueText, available, showDialog, manualDialog, field, demo } = api;
+    const catalog = { items: [], query: '', filter: 'all', cursor: null, more: false, total: null, busy: false, available: false, source: '', serial: 0, onSelect: null, multi: false, mode: '', selected: new Map() };
+    const moments = { items: [], cursor: null, more: false, loaded: false, busy: false, available: false, source: '', detail: '', error: '', friend: null, results: new Map(), running: new Set(), serial: 0 };
+    const histories = new Map(), momentMedia = new Map();
+    let appearance = { theme: 'night', font_scale: 1, background_url: '' }, introTimer, searchTimer, importBusy = false, catchupSessionId = '', catchupBusy = false;
+    const agent = { selected: [], result: null, busy: false, error: '', progress: '' };
+    const work = { busy: false, error: '', phase: 'reading', startedAt: 0, progressTimer: null, cancelRequested: false, tab: 'chat', sessions: [], current: null, loading: false, loaded: false, attachments: [], drafts: new Map(), attachmentsBySession: new Map(), config: { work_base_url: '', work_model: '', work_api_key: '' }, configBusy: false, testMessage: '', demoSessions: [] };
+
+    function safeMedia(value) {
+      if (typeof value !== 'string' || !value || value.length > 28 * 1024 * 1024) return '';
+      if (/^data:image\/(png|jpe?g|webp|gif);base64,[a-z0-9+/=\s]+$/i.test(value)) return value;
+      try {
+        const url = new URL(value, location.href);
+        if (url.username || url.password) return '';
+        if (url.protocol === 'file:' && location.protocol === 'file:') return url.href;
+        if (url.protocol === location.protocol && url.origin === location.origin && /\.(png|jpe?g|webp|gif|svg)(?:$|\?)/i.test(url.pathname)) return url.href;
+      } catch { /* Unsupported media stays a visible placeholder. */ }
+      return '';
+    }
+
+    function updateState(state) {
+      const next = state.appearance || {};
+      const theme = ['paper', 'aurora'].includes(next.theme) ? next.theme : 'night';
+      const scale = Number(next.font_scale || appearance.font_scale || 1);
+      const normalized = Math.max(90, Math.min(130, Math.round((scale > 3 ? scale : scale * 100) / 10) * 10));
+      const background = next.background_url !== undefined ? next.background_url : appearance.background_url;
+      appearance = { ...appearance, ...next, theme, font_scale: normalized / 100, background_url: background || '' };
+      document.documentElement.dataset.theme = theme;
+      document.documentElement.dataset.motion = next.motion === false ? 'reduced' : 'full';
+      document.documentElement.style.setProperty('--background-dim', String(next.background_dim ?? .7));
+      document.documentElement.dataset.fontScale = String(normalized);
+      document.documentElement.dataset.capture = state.status?.capture || 'idle';
+      const image = $('#scene-background'), source = safeMedia(appearance.background_url);
+      if (image.dataset.source !== source) { image.dataset.source = source; image.hidden = !source; if (source) image.src = source; else image.removeAttribute('src'); }
+      document.documentElement.classList.toggle('has-scene-background', Boolean(source));
+      const progress = state.catalog?.progress;
+      if (importBusy && progress) {
+        const target = $('.catalog-import-status');
+        if (target) target.textContent = `正在索引 ${Number(progress.sessions || 0)} 个会话、${Number(progress.messages || 0)} 条消息；可关闭窗口继续使用。`;
+      }
+      const incoming = state.catalog?.preview_updates;
+      const updates = Array.isArray(incoming) ? incoming : incoming && typeof incoming === 'object' ? Object.entries(incoming).map(([id, item]) => ({ id, ...item })) : [];
+      if ($('#session-catalog').open && updates.length) {
+        const rows = [...$('#session-catalog').querySelectorAll('.catalog-row')];
+        for (const update of updates) {
+          const item = catalog.items.find(item => item.id === update.id); if (!item) continue;
+          Object.assign(item, update);
+          const row = rows.find(row => row.dataset.sessionId === String(update.id)); if (!row) continue;
+          $('.catalog-preview', row).textContent = previewText(item);
+          const name = $('.catalog-title>span:first-child', row); if (name) name.textContent = displayName(item);
+          const time = $('time', row); if (time) time.textContent = formatTime(item.updated || item.timestamp);
+          row.classList.toggle('preview-pending', item.preview_status === 'pending');
+        }
+      }
+    }
+
+    function dismissIntro() {
+      clearTimeout(introTimer);
+      const intro = $('#cinema-intro');
+      if (intro) { intro.classList.add('intro-leaving'); setTimeout(() => intro.remove(), 300); }
+      document.documentElement.classList.remove('intro-active');
+    }
+    function startIntro(force = false) {
+      if (!force && (getState().appearance?.intro_enabled === false || getState().appearance?.motion === false || new URLSearchParams(location.search).get('intro') === '0' || matchMedia('(prefers-reduced-motion: reduce)').matches)) return;
+      $('#cinema-intro')?.remove(); clearTimeout(introTimer);
+      const intro = el('section', 'cinema-intro'); intro.id = 'cinema-intro'; intro.setAttribute('aria-label', 'ChatBot 开场');
+      const ambience = el('div', 'paper-intro-sheet'); ambience.setAttribute('aria-hidden', 'true');
+      const strings = el('div', 'paper-intro-lines'); strings.setAttribute('aria-hidden', 'true');
+      for (let i = 0; i < 4; i++) strings.append(el('i'));
+      const glyph = el('img', 'paper-intro-mark'); glyph.src = 'mark.svg'; glyph.alt = '';
+      const title = append(el('div', 'intro-title'), el('span', '', 'ChatBot'));
+      const skip = button('跳过开场', 'arrow', dismissIntro, 'intro-skip'); skip.id = 'intro-skip';
+      append(intro, ambience, strings, append(el('div', 'intro-center'), glyph, title, el('p', 'intro-subtitle', '读懂来意，回得有分寸。')), append(el('div', 'intro-bottom'), el('span', '', '翻开一页，接续对话'), el('div', 'intro-progress')), skip);
+      document.body.append(intro); document.documentElement.classList.add('intro-active');
+      introTimer = setTimeout(dismissIntro, matchMedia('(prefers-reduced-motion: reduce)').matches ? 300 : 3400);
+      skip.focus({ preventScroll: true });
+    }
+
+    function messageKind(message) {
+      if (message.kind === 'emoji' || message.emoji_md5) return 'emoji';
+      if (['image', 'voice'].includes(message.kind)) return message.kind;
+      if (message.transcript) return 'voice';
+      if (message.image_description) return 'image';
+      if (Array.isArray(message.media)) { const asset = message.media.find(asset => ['image', 'voice', 'audio'].includes(asset.kind)); if (asset) return asset.kind === 'audio' ? 'voice' : asset.kind; }
+      const text = String(message.text || '');
+      if (/^\[(图片|image)\]$/i.test(text)) return 'image';
+      if (/^\[(语音|voice)\]/i.test(text)) return 'voice';
+      return 'text';
+    }
+    function previewText(session) {
+      if (session.preview_status === 'pending') return '正在补齐最近一条消息…';
+      const last = session.last_message;
+      const raw = typeof last === 'object' && last ? last.text : session.preview || last || '';
+      const kind = typeof last === 'object' && last ? last.kind : session.kind || session.last_message_kind;
+      const prefix = kind === 'image' ? '[图片]' : kind === 'voice' ? '[语音]' : '';
+      if (prefix && String(raw).startsWith(prefix)) return String(raw);
+      return `${prefix}${prefix && raw ? ' ' : ''}${raw || (prefix ? '' : '尚无可读的消息预览')}`;
+    }
+    function displayName(item) { return String(item.title || item.name || item.display_name || item.remark || '未命名会话'); }
+    function catalogSourceName(source) { return ({ wechat_db: '本机微信数据库', weflow: 'WeFlow 本地接口', ocr: '微信可见窗口', import: '已导入记录', manual: '手动提供对话', demo: '合成演示数据', collected: '已采集会话' })[source] || '本地会话'; }
+
+    function openCatalog(onSelect = null, options = {}) {
+      const dialog = $('#session-catalog');
+      if (dialog.open) { $('#session-search')?.focus({ preventScroll: true }); return; }
+      catalog.serial++; catalog.items = []; catalog.query = ''; catalog.filter = 'all'; catalog.cursor = null; catalog.more = false; catalog.onSelect = onSelect; catalog.busy = false;
+      catalog.multi = Boolean(options.multi); catalog.mode = options.mode || ''; catalog.selected = new Map((options.selected || []).map(item => [String(item.session_id), { session_id: String(item.session_id), title: item.title, is_group: Boolean(item.is_group), type: item.type || (item.is_group ? 'group' : 'private'), source: item.source }]));
+      dialog.replaceChildren();
+      const input = el('input', 'input'); input.id = 'session-search'; input.type = 'search'; input.placeholder = '搜索好友、群聊或会话名称'; input.autocomplete = 'off'; input.setAttribute('aria-label', input.placeholder);
+      input.addEventListener('input', () => { clearTimeout(searchTimer); catalog.query = input.value; catalog.serial++; catalog.busy = false; searchTimer = setTimeout(() => fetchCatalog(true), 220); });
+      const filters = el('div', 'catalog-filters');
+      for (const [value, label] of [['all', '全部可用'], ['wechat_db', '本机微信数据库'], ['weflow', 'WeFlow'], ['import', '已导入'], ['collected', '已采集']]) {
+        const filter = el('button', `catalog-filter${value === 'all' ? ' active' : ''}`, label); filter.type = 'button'; filter.dataset.filter = value;
+        filter.addEventListener('click', () => { catalog.filter = value; catalog.serial++; catalog.busy = false; filters.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === filter)); fetchCatalog(true); }); filters.append(filter);
+      }
+      const isAgent = catalog.mode === 'agent';
+      append(dialog,
+        append(el('div', 'catalog-heading'), append(el('div'), el('div', 'eyebrow', isAgent ? 'ChatBot Agent · 分析范围' : catalog.multi ? '自动回复范围' : onSelect ? '选择联系人' : '你的对话空间'), el('h2', '', isAgent ? '选择最多 3 段对话' : catalog.multi ? '选择允许自动回复的会话' : onSelect ? '选择好友' : '全局会话')), iconButton('关闭会话窗口', 'close', () => dialog.close())),
+        append(el('div', 'catalog-search'), icon('search', 18), input),
+        filters, el('div', 'catalog-source'), el('div', 'catalog-list'), el('div', 'catalog-pagination'),
+        append(el('div', 'catalog-footer'), el('span', 'catalog-import-status', isAgent ? '可选择任意来源，包括导入、手动提供和历史会话；仅分析并给出建议，不会发送。' : catalog.multi ? '只会列出已核验可实时接收的会话；归档记录不支持自动发送。' : importBusy ? '正在本机索引，可关闭此窗口继续使用' : '支持本机微信数据库 / ChatLab 导出的 JSON、JSONL'), catalog.multi ? append(el('div', 'catalog-import-actions'), button('取消', null, () => dialog.close(), 'small subtle'), button('应用选择', 'check', async () => { try { await catalog.onSelect?.([...catalog.selected.values()]); dialog.close(); } catch (err) { toast(errorText(err), 'error'); } }, 'small primary')) : append(el('div', 'catalog-import-actions'), button('粘贴对话', 'pen', () => { dialog.close(); manualDialog(); }, 'small ghost'), importButton('files', '导入文件', 'upload'), importButton('folder', '导入目录', 'folder'))));
+      const list = $('.catalog-list', dialog); let scrollFrame; list.addEventListener('scroll', () => { cancelAnimationFrame(scrollFrame); scrollFrame = requestAnimationFrame(() => { if (catalog.items.length > 80) paintCatalog(); if (catalog.more && !catalog.busy && list.scrollHeight - list.scrollTop - list.clientHeight < 180) fetchCatalog(false); }); });
+      dialog.showModal(); input.focus({ preventScroll: true }); fetchCatalog(true);
+    }
+    function importButton(mode, label, symbol) {
+      const b = button(label, symbol, async () => {
+        if (importBusy) return; importBusy = true;
+        $('#session-catalog').querySelectorAll('.import-source').forEach(button => { button.disabled = true; });
+        const status = $('.catalog-import-status'); if (status) status.textContent = '正在本机索引，可关闭此窗口继续使用…';
+        try {
+          const result = await rpc('import_chat_records', { mode });
+          if (result.cancelled) return;
+          if (result.success === false) throw new Error(result.message || '导入未完成。');
+          toast(result.message || `已导入 ${result.sessions ?? result.session_count ?? 0} 个会话、${result.messages ?? result.message_count ?? 0} 条消息`);
+          await sync(); if ($('#session-catalog').open) await fetchCatalog(true);
+        } finally {
+          importBusy = false; $('#session-catalog').querySelectorAll('.import-source').forEach(button => { button.disabled = !available(); });
+          const status = $('.catalog-import-status'); if (status) status.textContent = '支持本机微信数据库 / ChatLab 导出的 JSON、JSONL';
+        }
+      }, 'small subtle', !available() || importBusy);
+      b.classList.add('import-source'); return b;
+    }
+    async function fetchCatalog(reset) {
+      if (catalog.busy) return;
+      const serial = ++catalog.serial; catalog.busy = true;
+      if (reset) { catalog.items = []; catalog.cursor = null; $('.catalog-list', $('#session-catalog')).scrollTop = 0; }
+      paintCatalog();
+      try {
+        const result = await rpc('list_sessions', { query: catalog.query.trim(), source: catalog.filter, cursor: reset ? null : catalog.cursor, limit: 12 });
+        if (serial !== catalog.serial) return;
+        catalog.available = result.available !== false; catalog.source = result.source || '';
+        catalog.detail = result.warning || result.detail || result.message || ''; catalog.total = result.total ?? null;
+        const seen = new Set(catalog.items.map(i => i.id));
+        for (const item of result.items || []) if (item.id && !seen.has(item.id)) { catalog.items.push(item); seen.add(item.id); }
+        for (const update of Array.isArray(getState().catalog?.preview_updates) ? getState().catalog.preview_updates : []) {
+          const item = catalog.items.find(item => item.id === update.id && item.preview_status === 'pending');
+          if (item) Object.assign(item, update);
+        }
+        catalog.cursor = result.next_cursor ?? null; catalog.more = Boolean(result.has_more && catalog.cursor !== null); catalog.error = '';
+      } catch (err) {
+        if (serial !== catalog.serial) return;
+        catalog.error = errorText(err); catalog.available = false;
+        if (reset) catalog.items = getState().sessions.filter(s => !catalog.query || displayName(s).includes(catalog.query));
+      } finally { if (serial === catalog.serial) { catalog.busy = false; paintCatalog(); } }
+    }
+    function paintCatalog() {
+      const dialog = $('#session-catalog'); if (!dialog.open) return;
+      const list = $('.catalog-list', dialog), oldTop = list.scrollTop;
+      list.replaceChildren();
+      const source = $('.catalog-source', dialog); source.replaceChildren();
+      if (catalog.error) source.append(notice(catalog.error, 'error'));
+      else if (!catalog.available && !catalog.busy) source.append(notice(catalog.detail || '当前没有已连接的会话目录。选择本机微信数据库来源后，此列表只显示数据适配器已读取到的会话；也可连接 WeFlow 或导入记录。', 'info'));
+      else { if (catalog.detail && !catalog.busy) source.append(notice(catalog.detail, 'info')); source.append(append(el('div', 'catalog-meta'), el('span', '', catalog.source === 'demo' ? '合成演示会话' : catalog.source === 'wechat_db' ? '本机微信数据库会话' : catalog.source === 'weflow' ? 'WeFlow 会话目录' : '当前可用会话'), el('span', '', catalog.total === null ? `已加载 ${catalog.items.length} 个` : `${catalog.total} 个会话`))); }
+      if (catalog.busy && !catalog.items.length) list.append(append(el('div', 'catalog-loading'), el('div', 'skeleton wide'), el('div', 'skeleton medium'), el('div', 'skeleton wide')));
+      const visibleItems = catalog.items.filter(item => !(catalog.multi && catalog.mode !== 'agent' && !item.auto_reply_eligible));
+      const virtual = visibleItems.length > 80, start = virtual ? Math.max(0, Math.floor(oldTop / 80) - 5) : 0, end = virtual ? Math.min(visibleItems.length, start + 35) : visibleItems.length;
+      if (start) { const spacer = el('div', 'catalog-spacer'); spacer.style.height = `${start * 80}px`; list.append(spacer); }
+      for (const item of visibleItems.slice(start, end)) {
+        const group = Boolean(item.type === 'group' || item.is_group || String(item.id).endsWith('@chatroom'));
+        const chosen = catalog.selected.has(String(item.id));
+        const row = el('button', `catalog-row${chosen || item.id === getState().current_session?.id ? ' selected' : ''}${item.preview_status === 'pending' ? ' preview-pending' : ''}${catalog.multi ? ' catalog-multi-row' : ''}`); row.type = 'button'; row.dataset.sessionId = String(item.id); if (catalog.multi) row.setAttribute('aria-pressed', String(chosen));
+        const name = displayName(item);
+        const sourceHint = item.source === 'wechat_db' ? '数据库会话' : item.source === 'weflow' ? 'WeFlow 会话' : item.source === 'ocr' ? '微信可见窗口会话' : '本地会话';
+        append(row, append(el('span', `catalog-avatar${group ? ' group-avatar' : ''}`), group ? icon('people', 19) : el('span', '', name.slice(0, 1))), append(el('span', 'catalog-copy'), append(el('span', 'catalog-title'), el('span', '', name), group ? tag('群聊') : null), el('span', 'catalog-preview', catalog.multi ? (catalog.mode === 'agent' ? `${catalogSourceName(item.source)} · ${group ? '群聊' : '私聊'} · 仅作分析建议` : `${sourceHint} · 允许回复范围；发送通道另行核验`) : previewText(item))), append(el('span', 'catalog-trailing'), el('time', '', formatTime(item.updated || item.timestamp)), catalog.multi ? el('span', `catalog-choice${chosen ? ' chosen' : ''}`, chosen ? '已选择' : '选择') : item.id === getState().current_session?.id ? icon('check', 14) : icon('arrow', 14)));
+        row.addEventListener('click', async () => {
+          row.disabled = true; row.classList.add('selecting');
+          try { if (catalog.multi) { if (catalog.selected.has(String(item.id))) catalog.selected.delete(String(item.id)); else { if (catalog.mode === 'agent' && catalog.selected.size >= 3) { toast('Agent 一次最多分析 3 段对话。'); row.disabled = false; row.classList.remove('selecting'); return; } if (catalog.mode !== 'agent' && (item.source === 'ocr' || [...catalog.selected.values()].some(entry => entry.source === 'ocr'))) catalog.selected.clear(); catalog.selected.set(String(item.id), { session_id: String(item.id), title: name, is_group: group, type: group ? 'group' : 'private', source: item.source }); } paintCatalog(); } else { if (catalog.onSelect) await catalog.onSelect(item); else { await rpc('select_session', { session_id: item.id }); await sync(); go('workspace'); } dialog.close(); } }
+          catch (err) { toast(errorText(err), 'error'); row.disabled = false; row.classList.remove('selecting'); }
+        }); list.append(row);
+      }
+      if (virtual && end < visibleItems.length) { const spacer = el('div', 'catalog-spacer'); spacer.style.height = `${(visibleItems.length - end) * 80}px`; list.append(spacer); }
+      if (!list.querySelector('.catalog-row') && !catalog.busy) list.append(empty(catalog.multi && catalog.mode === 'agent' ? '没有找到可分析的对话' : catalog.multi ? '没有已核验的实时会话' : catalog.query ? '没有找到匹配的会话' : '还没有可用的会话', catalog.multi && catalog.mode === 'agent' ? '检查数据源筛选，或手动补充、导入一段对话后再分析。' : catalog.multi ? '导入记录和未核验的会话不会出现在自动回复名单里。' : catalog.query ? '尝试换一个名字，或手动导入对话。' : '打开微信并读取一次，或在设置中连接会话数据源。', 'chat'));
+      list.scrollTop = oldTop;
+      const footer = $('.catalog-pagination', dialog); footer.replaceChildren();
+      if (catalog.more) footer.append(button(catalog.busy ? '正在加载…' : '加载更多会话', 'chevron', () => fetchCatalog(false), 'small', catalog.busy));
+      else if (catalog.items.length && !catalog.busy) footer.append(el('span', 'subtle-caption', catalog.available ? '已显示当前目录中的全部匹配会话' : '以上为当前已读取的会话'));
+    }
+
+    function renderTriage() {
+      const root = el('section', 'page agent-page'), selected = agent.selected;
+      root.append(heading('ChatBot Agent', '一次整理最多三段对话，给出下一步建议和对应依据。', '对话分诊 · 只分析，不发送'));
+      const intro = el('section', 'panel agent-mission');
+      intro.append(append(el('div', 'agent-orbit'), el('span', '', '笺')), append(el('div', 'agent-mission-copy'), el('span', 'eyebrow', '本轮任务'), el('h2', '', '先看清语境，再决定下一步。'), el('p', '', 'Agent 会逐段检查所选对话，整理建议动作、理由与消息依据。任何回复都只作为候选文本供你自行复制和确认。')));
+      intro.append(button(selected.length ? `管理选择（${selected.length}/3）` : '选择对话', 'people', () => openCatalog(async items => { agent.selected = items; agent.result = null; agent.error = ''; render(); }, { multi: true, mode: 'agent', selected }), 'subtle', agent.busy));
+      root.append(intro);
+      const selection = el('section', 'panel agent-selection');
+      selection.append(append(el('div', 'agent-section-heading'), el('h2', '', '本轮对话'), el('span', 'agent-count', `${selected.length} / 3`)));
+      if (!selected.length) selection.append(el('p', 'field-hint', '选择任何可用来源中的对话：微信数据库、WeFlow、导入记录、手动对话或已读取会话。'));
+      for (const item of selected) selection.append(append(el('div', 'agent-selected-row'), el('span', 'agent-selected-mark', item.is_group ? '群' : '笺'), append(el('span', 'agent-selected-copy'), el('strong', '', item.title || item.session_id), el('span', '', `${catalogSourceName(item.source)} · ${item.is_group ? '群聊' : '私聊'}`)), button('移除', 'close', () => { agent.selected = agent.selected.filter(x => x.session_id !== item.session_id); agent.result = null; render(); }, 'small ghost', agent.busy)));
+      root.append(selection);
+      const configured = Boolean(getState().config?.has_api_key && getState().config?.base_url && getState().config?.model_name);
+      if (agent.error) root.append(notice(agent.error, 'error'));
+      if (!configured && !demo) root.append(notice('尚未配置模型 API Key 和模型信息。请先到「设置」完成配置，再运行 Agent。', 'info'));
+      const canRun = selected.length > 0 && !agent.busy && (configured || demo) && available();
+      const runRow = append(el('div', 'agent-run-row'), button(agent.busy ? '正在分析…' : agent.result ? '重新分析' : '开始分诊', agent.busy ? null : 'spark', async () => {
+        if (!agent.selected.length) return;
+        agent.busy = true; agent.error = ''; agent.result = null; agent.progress = '正在逐段检查所选对话…'; render();
+        try {
+          const result = await rpc('run_agent', { session_ids: agent.selected.slice(0, 3).map(item => item.session_id) });
+          if (!result || result.available === false || result.success === false) throw new Error(result?.message || result?.reason || 'Agent 暂时无法运行。');
+          agent.result = result; agent.progress = '';
+          if (result.status === 'partial') agent.error = result.message || '部分会话未能完成分析；已展示当前可用结果。';
+        } catch (err) { agent.error = errorText(err); }
+        finally { agent.busy = false; agent.progress = ''; render(); }
+      }, 'primary', !canRun));
+      runRow.append(demo ? tag('合成演示 · 不连接微信', 'demo-tag') : el('span', 'agent-safe-note', '不会发送或修改任何消息')); root.append(runRow);
+      if (agent.busy) { const loading = el('section', 'panel agent-progress'); loading.setAttribute('role', 'status'); loading.setAttribute('aria-live', 'polite'); loading.append(el('span', 'agent-spinner'), el('div', '', agent.progress || '正在分析…'), el('p', '', `正在处理 ${selected.length} 段对话。此过程只读取内容并生成建议。`)); for (const item of selected) loading.append(el('div', 'agent-progress-item', `检查中 · ${item.title || item.session_id}`)); root.append(loading); }
+      if (agent.result) {
+        const results = el('section', 'agent-results'), cards = Array.isArray(agent.result.cards) ? agent.result.cards : [];
+        results.append(append(el('div', 'agent-results-heading'), append(el('div'), el('span', 'eyebrow', demo ? '合成样例' : '分析结果'), el('h2', '', agent.result.status === 'partial' ? '部分完成' : '建议已整理'), el('p', 'field-hint', '依据来自所选会话快照；建议和候选文本不会触发发送。')), el('span', 'agent-results-count', `${cards.length} 项`)));
+        for (const data of cards) results.append(agentCard(data)); root.append(results);
+        if (Array.isArray(agent.result.trace) && agent.result.trace.length) { const trace = el('details', 'panel agent-trace'); trace.append(el('summary', '', '处理记录'), el('p', 'field-hint', '本轮工具状态摘要。')); const list = el('ul'); for (const step of agent.result.trace) list.append(el('li', '', `${step.session_id || '会话'} · ${step.tool || '处理'} · ${agentStatusLabel(step.status)}`)); trace.append(list); root.append(trace); }
+      }
+      return root;
+    }
+    function workInput(label, key, type = 'text', placeholder = '') {
+      const wrap = el('label', 'work-field'); wrap.append(el('span', 'field-label', label));
+      const input = el('input', 'input'); input.type = type; input.autocomplete = 'off'; input.placeholder = placeholder; input.value = type === 'password' ? '' : work.config[key] || '';
+      input.addEventListener('input', () => { work.config[key] = input.value; }); wrap.append(input); return wrap;
+    }
+    function workMessage(msg) {
+      const row = el('article', `work-message work-message-${msg.role === 'user' ? 'user' : 'assistant'}`);
+      row.append(el('span', 'work-message-role', msg.role === 'user' ? '你' : 'ChatBot Agent'), el('div', 'work-message-content', msg.content || ''));
+      const linked = (msg.attachment_ids || []).map(id => (work.current?.attachments || []).find(a => a.id === id)).filter(Boolean);
+      if (linked.length) { const chips = el('div', 'work-inline-attachments'); for (const file of linked) chips.append(el('span', 'work-file-chip', `${file.kind === 'image' ? '图片' : '文件'} · ${file.name}`)); row.append(chips); }
+      if (msg.role !== 'user' && (msg.sources?.length || msg.trace?.length)) {
+        const details = el('details', 'work-evidence'); details.append(el('summary', '', `来源与工具记录 · ${(msg.sources || []).length} 个来源 · ${(msg.trace || []).length} 项工具`));
+        for (const src of msg.sources || []) details.append(el('div', 'work-evidence-item', `来源 · ${src.name || src.id}`));
+        for (const step of msg.trace || []) details.append(el('div', 'work-evidence-item', `工具 · ${step.tool || '处理'} · ${agentStatusLabel(step.status)}`)); row.append(details);
+      }
+      return row;
+    }
+    async function workRefresh() {
+      if (work.loading) return; work.loading = true;
+      try {
+        const response = demo ? { sessions: work.demoSessions } : await rpc('work_agent_list');
+        work.sessions = response.sessions || [];
+      } catch (err) { work.error = errorText(err); }
+      finally { work.loaded = true; work.loading = false; if (getPage() === 'agent') render(); }
+    }
+    async function workSelect(id) {
+      if (work.busy || work.current?.id === id) return;
+      work.error = '';
+      try { const response = demo ? { session: work.demoSessions.find(s => s.id === id) } : await rpc('work_agent_load', { session_id: id });
+        work.current = response.session; work.attachments = work.attachmentsBySession.get(String(id)) || []; render();
+      } catch (err) { work.error = errorText(err); render(); }
+    }
+    async function workCreate() {
+      if (work.busy) return;
+      work.error = '';
+      try {
+        let session;
+        if (demo) { session = { id: `demo-${Date.now()}`, title: '新的演示任务', messages: [], attachments: [], artifacts: [] }; work.demoSessions.unshift(session); }
+        else session = (await rpc('work_agent_create')).session;
+        work.sessions = [session, ...work.sessions.filter(s => s.id !== session.id)]; work.current = session; work.attachments = work.attachmentsBySession.get(String(session.id)) || []; render();
+      } catch (err) { work.error = errorText(err); render(); }
+    }
+    async function workAttach() {
+      if (demo) { toast('演示模式不会打开本机文件；附件功能可在桌面连接模式使用。'); return; }
+      if (!work.current) return;
+      try { const result = await rpc('work_agent_attach', { session_id: work.current.id });
+        if (result.cancelled) return;
+        const files = result.attachments || []; work.attachments.push(...files); work.attachmentsBySession.set(String(work.current.id), work.attachments); work.current.attachments = [...(work.current.attachments || []), ...files]; render();
+      } catch (err) { toast(errorText(err), 'error'); }
+    }
+    async function workSend(text) {
+      if (!work.current || work.busy) return;
+      const sessionId = String(work.current.id), typed = String(text || '').trim(), originalAttachments = [...work.attachments], ids = originalAttachments.map(a => a.id);
+      if (!typed && !ids.length) return;
+      const content = typed || '请处理我附加的文件。';
+      work.drafts.set(sessionId, typed);
+      const localUser = { id: `local-${Date.now()}`, role: 'user', content, attachment_ids: ids, created: new Date().toISOString() };
+      work.current.messages = [...(work.current.messages || []), localUser]; work.attachments = []; work.attachmentsBySession.set(sessionId, []); work.busy = true; work.error = ''; work.phase = 'reading'; work.startedAt = Date.now(); work.cancelRequested = false; clearInterval(work.progressTimer); work.progressTimer = setInterval(updateWorkProgress, 1000); render();
+      try {
+        let response;
+        if (demo) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          const answer = '这是合成演示回复。演示模式没有调用外部模型，也没有访问本机文件。你可以在设置卡片中体验连接测试与配置界面。';
+          response = { session: { ...work.current, title: work.current.title === '新的演示任务' ? content.slice(0, 32) : work.current.title, messages: [...work.current.messages, { id: `demo-assistant-${Date.now()}`, role: 'assistant', content: answer, created: new Date().toISOString(), sources: [], trace: [{ tool: 'demo_response', status: 'demo_only' }] }] }, result: { answer, artifacts: [], sources: [], trace: [{ tool: 'demo_response', status: 'demo_only' }], mode: 'demo' } };
+        } else response = await rpc('work_agent_turn', { session_id: sessionId, text: content, attachment_ids: ids });
+        work.current = response.session;
+        if (response.result?.artifacts?.length && !(work.current.artifacts || []).length) work.current.artifacts = response.result.artifacts;
+        if (response.result) { const last = (work.current.messages || []).at(-1); if (last?.role === 'assistant') { if (!last.sources) last.sources = response.result.sources || []; if (!last.trace) last.trace = response.result.trace || []; } }
+        work.drafts.delete(sessionId);
+        work.sessions = [response.session, ...work.sessions.filter(s => s.id !== response.session.id)]; work.result = response.result || null;
+      } catch (err) {
+        if (String(work.current?.id) === sessionId) work.current.messages = (work.current.messages || []).filter(message => message.id !== localUser.id);
+        work.drafts.set(sessionId, typed);
+        work.attachments = originalAttachments;
+        work.attachmentsBySession.set(sessionId, work.attachments);
+        work.error = errorText(err);
+      }
+      finally { work.busy = false; clearInterval(work.progressTimer); work.progressTimer = null; render(); }
+    }
+    const workPhaseLabels = { reading: '正在读取任务和附件', model: '模型正在处理', saving: '正在保存回复和产物', stopping: '正在停止任务', done: '任务已完成' };
+    function updateWorkProgress() {
+      const elapsed = Math.max(0, Math.floor((Date.now() - work.startedAt) / 1000));
+      const node = $('.work-working');
+      if (!node) return;
+      const phase = node.querySelector('.work-phase'); if (phase) phase.textContent = workPhaseLabels[work.phase] || workPhaseLabels.reading;
+      const time = node.querySelector('.work-elapsed'); if (time) time.textContent = `${elapsed} 秒`;
+    }
+    function handleWorkProgress(data) {
+      if (!work.busy || String(data?.session_id) !== String(work.current?.id)) return;
+      if (Object.prototype.hasOwnProperty.call(workPhaseLabels, data.phase)) work.phase = data.phase;
+      updateWorkProgress();
+    }
+    async function workStop() {
+      if (!work.busy || demo || work.cancelRequested || !work.current) return;
+      work.cancelRequested = true; work.phase = 'stopping'; updateWorkProgress();
+      try { const outcome = await rpc('work_agent_cancel', { session_id: String(work.current.id) }); if (outcome?.success === false) throw new Error(outcome.message || '当前任务无法停止。'); }
+      catch (err) { work.cancelRequested = false; work.phase = 'model'; updateWorkProgress(); work.error = errorText(err); render(); }
+    }
+    async function workExport(artifact) {
+      if (demo) { toast('演示模式没有可导出的本机文件。'); return; }
+      try { const res = await rpc('work_agent_export', { session_id: work.current.id, artifact_id: artifact.id }); if (res.cancelled) return; if (res.success === false) throw new Error(res.message || '保存失败'); toast('文件已保存'); } catch (err) { toast(errorText(err), 'error'); }
+    }
+    async function workPreview(artifact) {
+      if (demo) { toast('演示模式没有可预览的本机成果。'); return; }
+      try {
+        const result = await rpc('work_agent_preview', { session_id: work.current.id, artifact_id: artifact.id });
+        const { dialog, body } = showDialog(result.name || artifact.name || '成果预览');
+        const preview = el('pre', 'work-artifact-preview', result.text || '（空文件）'); preview.tabIndex = 0;
+        body.append(preview, append(el('div', 'dialog-footer'), button('关闭', null, () => dialog.close()), button('保存文件', 'upload', () => workExport(artifact), 'primary')));
+      } catch (err) { toast(errorText(err), 'error'); }
+    }
+    async function workDelete() {
+      if (!work.current || work.busy) return;
+      const target = work.current, { dialog, body } = showDialog('删除这个任务？');
+      body.append(el('p', 'dialog-copy', `“${target.title || '未命名任务'}”及其对话和附件记录将被删除。此操作无法撤销。`));
+      const confirm = button('删除任务', 'trash', async () => {
+        try {
+          if (demo) work.demoSessions = work.demoSessions.filter(s => s.id !== target.id);
+          else await rpc('work_agent_delete', { session_id: target.id });
+          work.sessions = work.sessions.filter(s => s.id !== target.id); work.drafts.delete(String(target.id)); work.attachmentsBySession.delete(String(target.id));
+          if (String(work.current?.id) === String(target.id)) work.current = null;
+          dialog.close(); render();
+        } catch (err) { toast(errorText(err), 'error'); }
+      }, 'danger');
+      body.append(append(el('div', 'dialog-footer'), button('取消', null, () => dialog.close()), confirm));
+    }
+    async function workSaveConfig(testOnly = false) {
+      if (work.configBusy) return; work.configBusy = true; work.testMessage = '正在测试模型连接…'; render();
+      try {
+        const payload = { work_base_url: work.config.work_base_url.trim(), work_model: work.config.work_model.trim() };
+        if (work.config.work_api_key) payload.work_api_key = work.config.work_api_key;
+        if (testOnly) { const out = demo ? { success: true, message: '演示测试已通过；没有连接外部服务。' } : await rpc('work_agent_test', { config: payload }); work.testMessage = out.message || (out.success ? '连接成功' : '连接失败'); }
+        else { await rpc('save_config', { config: payload }); work.config.work_api_key = ''; work.testMessage = demo ? '演示设置已更新；合成数据只记录是否设置 Key。' : '工作 Agent 设置已保存'; }
+      } catch (err) { work.testMessage = errorText(err); }
+      finally { work.configBusy = false; render(); }
+    }
+    function renderWorkChat() {
+      const saved = getState().config || {};
+      if (!work.config.work_base_url && saved.work_base_url) work.config.work_base_url = saved.work_base_url;
+      if (!work.config.work_model && saved.work_model) work.config.work_model = saved.work_model;
+      if (!work.loaded) { if (!work.loading) workRefresh(); }
+      const root = el('section', 'page work-page');
+      const top = append(el('div', 'work-heading'), append(el('div'), el('span', 'eyebrow', 'WORK AGENT'), el('h1', '', '把任务交给 ChatBot')), el('span', 'work-demo-label', demo ? '演示模式 · 合成回复，不连接模型或本机文件' : '工作空间'));
+      root.append(top);
+      const tabs = el('div', 'work-tabs'); tabs.setAttribute('role', 'tablist'); tabs.setAttribute('aria-label', '工作区');
+      const workTabs = [['chat', '工作 Agent'], ['triage', '会话巡检'], ['settings', '模型设置']];
+      for (const [id, label] of workTabs) { const b = el('button', `work-tab${work.tab === id ? ' active' : ''}`, label); b.type = 'button'; b.id = `work-tab-${id}`; b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', String(work.tab === id)); b.tabIndex = work.tab === id ? 0 : -1; b.addEventListener('click', () => { work.tab = id; render(); }); b.addEventListener('keydown', event => { const order = workTabs.map(item => item[0]); const at = order.indexOf(id); const next = event.key === 'ArrowRight' ? order[(at + 1) % order.length] : event.key === 'ArrowLeft' ? order[(at - 1 + order.length) % order.length] : event.key === 'Home' ? order[0] : event.key === 'End' ? order.at(-1) : null; if (!next) return; event.preventDefault(); work.tab = next; render(); document.getElementById(`work-tab-${next}`)?.focus(); }); tabs.append(b); } root.append(tabs);
+      if (work.tab === 'triage') { root.append(renderTriage()); return root; }
+      if (work.tab === 'settings') {
+        const panel = el('section', 'panel work-settings'); panel.append(el('span', 'eyebrow', '独立模型连接'), el('h2', '', '工作 Agent 模型'), el('p', 'field-hint', '支持 OpenAI 兼容的 Chat Completions 接口；保持默认且主模型为 OpenAI 兼容接口时，自动复用「设置」里的主模型。发送任务时，你选择的文字、文件和图片内容会提交给这里配置的模型服务商处理；请先确认其数据处理政策。API Key 只在填写时提交；保存后不会回显。'), el('p', 'work-image-support', '图片支持取决于所选模型是否支持图像输入。'));
+        const grid = el('div', 'work-settings-grid'); grid.append(workInput('API Base URL', 'work_base_url', 'url', 'https://api.example.com/v1'), workInput('模型名称', 'work_model', 'text', 'model-name'), workInput('API Key', 'work_api_key', 'password', '仅在需要更换时填写')); panel.append(grid);
+        const actions = el('div', 'work-settings-actions'); actions.append(button('测试连接', 'pulse', () => workSaveConfig(true), 'subtle', work.configBusy), button('保存设置', 'check', () => workSaveConfig(false), 'primary', work.configBusy)); panel.append(actions);
+        if (work.testMessage) { const message = el('p', 'work-config-message', work.testMessage); message.setAttribute('role', 'status'); message.setAttribute('aria-live', 'polite'); panel.append(message); } root.append(panel); return root;
+      }
+      const layout = el('div', 'work-layout'), sidebar = el('aside', 'panel work-sidebar');
+      sidebar.append(append(el('div', 'work-sidebar-head'), el('h2', '', '任务'), button('新任务', 'plus', workCreate, 'small primary', work.busy)));
+      const list = el('div', 'work-task-list');
+      for (const item of work.sessions) { const b = el('button', `work-task${work.current?.id === item.id ? ' active' : ''}`); b.type = 'button'; b.disabled = work.busy || work.current?.id === item.id; if (work.current?.id === item.id) b.setAttribute('aria-current', 'page'); b.append(el('strong', '', item.title || '未命名任务'), el('span', '', item.preview || item.messages?.at(-1)?.content || '开始新的对话')); b.addEventListener('click', () => workSelect(item.id)); list.append(b); }
+      if (!work.sessions.length) list.append(el('p', 'field-hint', '还没有任务。点击「新任务」开始。')); sidebar.append(list);
+      const main = el('section', 'panel work-conversation');
+      if (!work.current) { const welcome = el('div', 'work-welcome'); welcome.append(el('div', 'work-welcome-mark', '笺'), el('h2', '', '今天想完成什么？'), el('p', '', '写下任务，或附上文件和图片。ChatBot 会在这里整理结果与可保存的产物。'), button('开始新任务', 'plus', workCreate, 'primary')); main.append(welcome); }
+      else {
+        const convoHead = append(el('div', 'work-conversation-head'), append(el('div'), el('span', 'eyebrow', '任务对话'), el('h2', '', work.current.title || '新任务')), button('删除任务', 'trash', workDelete, 'small ghost', work.busy)); main.append(convoHead);
+        const timeline = el('div', 'work-timeline'); timeline.setAttribute('role', 'log'); timeline.setAttribute('aria-live', 'polite'); timeline.setAttribute('aria-relevant', 'additions text'); for (const msg of work.current.messages || []) timeline.append(workMessage(msg));
+        if (work.busy) { const status = el('div', 'work-working'); status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); status.append(el('span', 'work-spinner'), el('span', 'work-phase', workPhaseLabels[work.phase] || workPhaseLabels.reading), el('span', 'work-elapsed', `${Math.floor((Date.now() - work.startedAt) / 1000)} 秒`)); timeline.append(status); }
+        if (!(work.current.messages || []).length) timeline.append(el('div', 'work-empty-hint', '描述一个任务，ChatBot 会在此处回复。'));
+        main.append(timeline);
+        const artifacts = el('div', 'work-artifacts'); for (const file of work.current.artifacts || []) { const card = append(el('article', 'work-artifact'), icon('folder', 18), append(el('div'), el('strong', '', file.name), el('span', '', `${file.mime_type || '文件'} · ${file.size || 0} bytes`)), button('预览', 'eye', () => workPreview(file), 'small ghost'), button('保存文件', 'upload', () => workExport(file), 'small subtle')); artifacts.append(card); } if (artifacts.childElementCount) main.append(artifacts);
+        if (work.error) main.append(notice(work.error, 'error'));
+        const composer = el('form', 'work-composer'), textarea = el('textarea', 'input'); textarea.rows = 3; textarea.placeholder = '描述你想完成的任务…'; textarea.setAttribute('aria-label', '任务消息'); textarea.disabled = work.busy;
+        const sessionId = String(work.current.id); textarea.value = work.drafts.get(sessionId) || ''; textarea.addEventListener('input', () => work.drafts.set(sessionId, textarea.value));
+        const pending = el('div', 'work-pending-files'); for (const file of work.attachments) { const chip = el('span', 'work-file-chip', `${file.kind === 'image' ? '图片' : '文件'} · ${file.name}`); const remove = el('button', 'work-chip-remove', '移除'); remove.type = 'button'; remove.disabled = work.busy; remove.setAttribute('aria-label', `移除附件 ${file.name}`); remove.addEventListener('click', () => { work.attachments = work.attachments.filter(a => a.id !== file.id); work.attachmentsBySession.set(sessionId, work.attachments); render(); }); chip.append(remove); pending.append(chip); }
+        const controls = el('div', 'work-composer-controls'); controls.append(button('添加文件或图片', 'plus', workAttach, 'subtle', work.busy), el('span', 'work-composer-hint', '未输入文字时，发送会请求 ChatBot 处理附件 · Enter 发送 · Shift+Enter 换行'), work.busy ? button(work.cancelRequested ? '正在停止…' : '停止', 'close', workStop, 'subtle', work.cancelRequested || demo) : button('发送', 'arrow', () => workSend(textarea.value), 'primary'));
+        composer.append(textarea, pending, controls); composer.addEventListener('submit', e => { e.preventDefault(); workSend(textarea.value); }); textarea.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); composer.requestSubmit(); } }); main.append(composer);
+      }
+      layout.append(sidebar, main); root.append(layout); return root;
+    }
+    function renderAgent() { return renderWorkChat(); }
+    function agentCard(data) {
+      const card = el('article', 'panel agent-card'), selected = agent.selected.find(item => item.session_id === String(data.session_id)) || {};
+      const labels = { reply_now: '建议现在回复', follow_up: '稍后跟进', wait: '先观察', no_action: '无需行动', review: '需要你判断' };
+      const score = Number.isFinite(data.risk) ? Math.max(0, Math.min(9, Math.round(data.risk))) : null;
+      const riskLevel = score === null ? 'unknown' : score <= 2 ? 'low' : score <= 5 ? 'medium' : 'high';
+      const riskText = score === null ? '风险待评估' : `风险 ${score}/9 · ${riskLevel === 'low' ? '较低' : riskLevel === 'medium' ? '中等' : '较高'}`;
+      card.append(append(el('div', 'agent-card-top'), append(el('div'), el('span', 'eyebrow', selected.title || data.title || '对话'), el('h3', '', labels[data.action] || data.action || '建议待确认')), tag(riskText, `risk-${riskLevel}`)));
+      if (data.confidence !== undefined && data.confidence !== null) card.append(el('span', 'agent-confidence', `判断把握 ${typeof data.confidence === 'number' ? Math.round(data.confidence <= 1 ? data.confidence * 100 : data.confidence) : data.confidence}%`));
+      if (data.reason) card.append(el('p', 'agent-reason', data.reason));
+      if (Array.isArray(data.evidence) && data.evidence.length) { const block = el('section', 'agent-evidence'); block.append(el('h4', '', '消息依据 · 所选会话快照')); for (const item of data.evidence) block.append(append(el('blockquote', 'agent-quote'), el('p', '', item.text || '（无文本内容）'), append(el('footer'), el('span', '', item.side === 'me' ? '我' : selected.title || '对方'), selected.source ? el('span', '', `来源 · ${selected.source}`) : null, item.message_id ? el('span', 'agent-citation', `消息 ${item.message_id}`) : null))); card.append(block); }
+      if (Array.isArray(data.candidates) && data.candidates.length) { const candidates = el('section', 'agent-candidates'); candidates.append(el('h4', '', '回复候选（复制后由你自行决定是否发送）')); for (const text of data.candidates) candidates.append(append(el('div', 'agent-candidate'), el('p', '', text), button('复制候选', 'copy', async () => { const result = await rpc('copy_reply', { text }); if (result?.success === false || result?.available === false) throw new Error(result.message || '复制失败。'); toast('候选文本已复制；请自行确认是否发送。'); }, 'small ghost'))); card.append(candidates); }
+      if (['reply_now','follow_up'].includes(data.action)) card.append(button('确认跟进行动', 'check', () => api.confirmFollowup(data.session_id), 'small subtle', agent.busy));
+      if (data.status) card.append(el('span', 'agent-card-status', `状态 · ${agentStatusLabel(data.status)}`)); return card;
+    }
+    function agentStatusLabel(status) { return ({ done: '已完成', partial: '部分完成', success: '成功', completed: '已完成', sample: '合成样例', demo_only: '演示状态', running: '进行中', pending: '等待处理', skipped: '已跳过', failed: '失败', error: '异常', unavailable: '不可用' })[status] || status || '完成'; }
+    function autoReplyState() { return getState().auto_reply || {}; }
+    function autoReplyStatus(a) {
+      if (a.status === 'emergency') return ['已紧急停止', 'error'];
+      if (a.status === 'blocked') return [a.waiting_for_target ? '等待允许会话' : '等待微信连接', 'paused'];
+      if (a.status === 'error') return ['需要处理', 'error'];
+      if (a.enabled && !a.paused) return ['运行中', 'active'];
+      if (a.enabled && a.paused) return ['已暂停', 'paused'];
+      return ['已关闭', 'off'];
+    }
+    function autoReplyCount(value, fallback) { const number = Number(value); return Number.isFinite(number) && number > 0 ? number : fallback; }
+    function autoReplyReason(item) {
+      const reasons = { not_mentioned: '群聊中未明确 @ 我', unverified_session: '会话未通过实时核验', session_not_visible: '微信当前未显示此会话', cooldown: '处于同会话冷却时间', hourly_limit: '达到每小时发送限额', daily_limit: '达到每日发送限额', no_reply_needed: '判断无需回复', duplicate: '重复消息已忽略', unsupported_message: '暂不支持此类消息', send_failed: '微信未确认发送成功', signature_appended: '回复已准备', demo_only: '合成演示未向微信发送消息' };
+      return reasons[item.reason] || (item.reason ? String(item.reason).slice(0, 160) : item.status === 'failed' ? '发送未完成' : item.status === 'skipped' ? '根据安全规则跳过' : '');
+    }
+    function catchupStatusText(catchup) {
+      const labels = { idle: '等待处理', judging: '正在判断是否值得回复', sending: '正在发送', sent: '已发送一条回复', skipped: '判断后未发送', failed: '处理失败' };
+      if (!catchup) return '尚未运行历史补回。';
+      const reason = autoReplyReason({ reason: catchup.reason, status: catchup.status });
+      return `${labels[catchup.status] || '状态未知'}${reason ? ` · ${reason}` : ''}`;
+    }
+    function confirmCatchup(session) {
+      const dialog = $('#editor'); dialog.replaceChildren(); dialog.className = 'dialog auto-reply-confirm';
+      const group = Boolean(session.is_group || session.type === 'group');
+      const groupRule = group ? (autoReplyState().group_mode === 'all' ? ' 群聊未明确 @ 我时，ChatBot 需要更高的判断置信度。' : ' 群聊仅在本轮有明确 @ 我证据时才会发送。') : '';
+      const copy = append(el('div', 'auto-reply-confirm-copy'), el('span', 'auto-reply-confirm-symbol', '↗'), el('div', 'eyebrow', demo ? '合成演示' : '单次发送确认'), el('h2', '', '运行一次历史补回？'), el('p', '', demo ? '演示模式只会更新合成状态，不会连接微信或发送消息。' : `只检查当前微信可见会话“${session.title || '已选会话'}”中最新一轮尚未解决的历史入站消息。ChatBot 会先判断现在是否值得回复；最多发送一条，并遵守会话核验、限额和其他发送规则。${groupRule}`));
+      const checks = el('div', 'auto-reply-confirm-checks');
+      checks.append(el('div', 'auto-reply-confirm-check', '点击下方确认即授权这一次判断与至多一条发送。'));
+      let ownDisplayName;
+      if (group) {
+        const nameField = el('label', 'field auto-reply-catchup-select'); nameField.append(el('span', 'field-label', '我在该群的显示名'));
+        ownDisplayName = el('input', 'input'); ownDisplayName.type = 'text'; ownDisplayName.maxLength = 80; ownDisplayName.autocomplete = 'off'; ownDisplayName.placeholder = autoReplyState().group_mode === 'all' ? '可留空；未 @ 我时要求更高置信度' : '留空时群聊会安全跳过';
+        nameField.append(ownDisplayName, el('span', 'field-hint', '仅用于本次确认群聊中的 @ 我证据，不会保存。')); checks.append(nameField);
+      }
+      const run = button(demo ? '模拟运行一次' : '确认并运行一次', 'play', async () => {
+        if (catchupBusy) return;
+        catchupBusy = true; run.disabled = true;
+        try {
+          const params = { session_id: session.session_id, acknowledge_send: true };
+          if (group) params.own_display_name = ownDisplayName.value.trim();
+          const result = await rpc('catch_up_auto_reply', params);
+          if (result?.started !== true) throw new Error(result?.message || '历史补回没有启动。');
+          dialog.close(); await sync(); render(); toast(demo ? '演示模式：仅更新合成状态，没有发送消息' : '已开始历史补回；结果会显示在本页');
+        } catch (err) { toast(errorText(err), 'error'); }
+        finally { catchupBusy = false; run.disabled = false; }
+      }, 'primary');
+      dialog.append(copy, checks, append(el('div', 'dialog-footer'), button('取消', null, () => dialog.close()), run)); dialog.showModal();
+    }
+    function renderAutoReply() {
+      const a = autoReplyState(), [statusText, statusClass] = autoReplyStatus(a), root = el('section', 'page auto-reply-page');
+      const liveCard = el('section', `auto-reply-status ${statusClass}`);
+      const statusIcon = append(el('span', 'auto-reply-status-icon'), icon(a.enabled && !a.paused ? 'pulse' : a.paused ? 'pause' : 'lock', 17));
+      const statusCopy = append(el('div', 'auto-reply-status-copy'), el('h2', '', `自动回复${statusText}`), el('p', '', a.enabled && !a.paused ? `正在替你回复名单里的 ${a.allowlist?.length || 0} 个会话${a.resume ? '；重启后自动恢复' : '；ChatBot 重开后需要重新开启'}。${a.wait_me_seconds ? `对方来消息先等你 ${a.wait_me_seconds} 秒。` : ''}` : a.paused ? '已暂停，不会发送新回复。' : a.allowlist?.length ? '名单已保存。点击开启后才会发送。' : '在工作台打开某个会话，点会话名右边的「自动回复」开关即可。'));
+      const statusActions = el('div', 'auto-reply-status-actions');
+      if (a.enabled && !a.paused) statusActions.append(button('暂停', 'pause', async () => { await rpc('pause_auto_reply', {}); await sync(); toast('自动回复已暂停'); }, 'small', !available()), button('紧急停止', 'close', () => emergencyStop(), 'small danger', !available()));
+      else if (a.enabled && a.paused) statusActions.append(button('继续', 'play', () => confirmAutoReplyStart(), 'small primary', !available()), button('紧急停止', 'close', () => emergencyStop(), 'small danger', !available()));
+      else statusActions.append(button('开启', 'play', () => confirmAutoReplyStart(), 'small primary', !available() || !a.allowlist?.length));
+      liveCard.append(statusIcon, statusCopy, statusActions); root.append(liveCard);
+      root.append(el('p', 'auto-reply-safety', '开启后，ChatBot 会以你的身份直接发送微信消息：只回复名单里的会话；群聊默认只回复 @你 的消息；受冷却时间和每日限额约束。'));
+
+      const people = el('section', 'auto-reply-block');
+      people.append(append(el('div', 'auto-reply-section-head'), el('h3', '', `回复名单 · ${a.allowlist?.length || 0}`),
+        button('添加会话', 'plus', () => openCatalog(async selected => { const typed = await confirmAutoReplyTypes(selected); if (!typed) return; await rpc('configure_auto_reply', { allowlist: typed, ...autoReplyPolicy() }); await sync(); toast('自动回复名单已更新'); }, { multi: true, selected: a.allowlist || [] }), 'small ghost', !available())));
+      const allowlist = el('div', 'auto-reply-allowlist');
+      if (a.allowlist?.length) for (const item of a.allowlist) allowlist.append(append(el('div', 'auto-reply-person'), append(el('span', `auto-reply-avatar${item.is_group ? ' group' : ''}`), item.is_group ? icon('people', 14) : el('span', '', (item.title || '笺').slice(0, 1))), append(el('span', 'auto-reply-person-copy'), el('strong', '', item.title || item.session_id), el('span', '', item.is_group ? (a.group_mode === 'all' ? '群聊 · 由 ChatBot 判断是否回复' : '群聊 · 只回复 @我') : '好友')), iconButton(`把「${item.title || '该会话'}」移出名单`, 'close', () => removeFromAllowlist(item.session_id), 'small')));
+      else allowlist.append(el('div', 'auto-reply-empty', '名单为空，ChatBot 不会向任何人发送消息。'));
+      people.append(allowlist); root.append(people);
+
+      const rules = el('details', 'auto-reply-fold'); rules.dataset.fold = 'auto-rules';
+      rules.append(el('summary', '', '回复规则'));
+      const form = el('form', 'auto-reply-policy');
+      const modeField = el('label', 'field auto-reply-group-mode'); modeField.append(el('span', 'field-label', '群聊'));
+      const select = el('select', 'input'); select.id = 'auto-reply-group-mode'; select.name = 'group_mode';
+      select.append(new Option('只回复明确 @我 的消息（推荐）', 'mention_only'), new Option('所有新消息都让 ChatBot 判断', 'all')); select.value = a.group_mode === 'all' ? 'all' : 'mention_only';
+      modeField.append(select);
+      const timing = el('div', 'form-two auto-reply-timing');
+      timing.append(autoReplyNumberField('等对方说完（秒）', 'debounce_seconds', a.debounce_seconds, 2, 15), autoReplyNumberField('同一会话间隔（秒）', 'cooldown_seconds', a.cooldown_seconds, 15, 3600));
+      const limits = el('div', 'form-two auto-reply-limits');
+      limits.append(autoReplyNumberField('每小时最多', 'hourly_limit', a.hourly_limit, 1, 30), autoReplyNumberField('每天最多', 'daily_limit', a.daily_limit, 1, 100));
+      const waitMe = autoReplyNumberField('先等我自己回（秒）', 'wait_me_seconds', a.wait_me_seconds || 0, 0, 180, '对方来消息后先等这么久，这期间你自己回了就不自动回；0 表示不等。');
+      form.append(modeField, timing, limits, waitMe);
+      form.append(append(el('div', 'auto-reply-form-footer'), el('span', 'field-hint', '保存规则会先暂停自动回复，需要重新开启。'), button('保存规则', 'check', async () => { if (!form.reportValidity()) return; await rpc('configure_auto_reply', { allowlist: a.allowlist || [], ...autoReplyPolicy(form) }); await sync(); toast('规则已保存'); }, 'small')));
+      rules.append(form); root.append(rules);
+
+      const currentSession = getState().current_session, permittedSessions = a.allowlist || [], visibleId = currentSession?.id;
+      if (!permittedSessions.some(item => item.session_id === catchupSessionId)) catchupSessionId = permittedSessions.find(item => item.session_id === visibleId)?.session_id || permittedSessions[0]?.session_id || '';
+      const selectedCatchup = permittedSessions.find(item => item.session_id === catchupSessionId);
+      const catchup = a.catchup;
+      if (permittedSessions.length) {
+        const catchupFold = el('details', 'auto-reply-fold'); catchupFold.dataset.fold = 'auto-catchup';
+        catchupFold.append(el('summary', '', '补回一条漏掉的消息'));
+        const catchupSelect = el('select', 'input'); catchupSelect.setAttribute('aria-label', '要补回的会话');
+        for (const item of permittedSessions) catchupSelect.append(new Option(`${item.title || item.session_id}${item.is_group ? ' · 群聊' : ''}`, item.session_id));
+        catchupSelect.value = catchupSessionId; catchupSelect.disabled = catchupBusy;
+        catchupSelect.addEventListener('change', () => { catchupSessionId = catchupSelect.value; render(true); });
+        const dbSelected = selectedCatchup?.source === 'wechat_db';
+        const chatMatches = Boolean(selectedCatchup && selectedCatchup.session_id === visibleId && (dbSelected ? getState().status?.capture === 'live' : getState().current_session?.active));
+        const catchupButton = button(catchupBusy ? '正在启动…' : '检查并补回一条', 'spark', () => selectedCatchup && confirmCatchup(selectedCatchup), 'small primary', !available() || !selectedCatchup || !chatMatches || catchupBusy || ['judging', 'sending'].includes(catchup?.status));
+        const state = el('p', 'auto-reply-catchup-state', catchupStatusText(catchup));
+        if (catchup?.session_id && catchup.session_id !== catchupSessionId) state.textContent = `${catchupStatusText(catchup)} · ${permittedSessions.find(item => item.session_id === catchup.session_id)?.title || '其他会话'}`;
+        catchupFold.append(el('p', 'field-hint', chatMatches ? '只看这个会话里最新一轮没回的消息，判断值得回才发，最多一条。' : '先在工作台打开这个会话，才能补回。'), catchupSelect, catchupButton, state);
+        root.append(catchupFold);
+      }
+
+      const recent = el('details', 'auto-reply-fold'); recent.dataset.fold = 'auto-recent';
+      recent.append(append(el('summary', ''), el('span', '', '最近处理'), el('span', 'auto-reply-quota', `本小时 ${Number(a.sent_hour || 0)}/${Number(a.hourly_limit || 0)} · 今日 ${Number(a.sent_day || 0)}/${Number(a.daily_limit || 0)}`)));
+      const list = el('div', 'auto-reply-recent-list');
+      const entries = (a.recent || []).slice(-12).reverse();
+      if (!entries.length) list.append(el('div', 'auto-reply-empty', '还没有记录。这里只显示会话和结果，不显示消息内容。'));
+      else for (const item of entries) {
+        const outcome = item.status === 'simulated' ? '模拟' : item.status === 'sent' ? '已发送' : item.status === 'skipped' ? '跳过' : item.status === 'failed' ? '失败' : '已处理';
+        const cls = item.status === 'simulated' ? 'simulated' : item.status === 'sent' ? 'sent' : item.status === 'failed' ? 'failed' : 'skipped';
+        list.append(append(el('div', 'auto-reply-event'), append(el('span', `auto-reply-outcome ${cls}`), outcome), append(el('span', 'auto-reply-event-title'), el('span', '', item.title || '未知会话')), el('span', 'auto-reply-event-reason', autoReplyReason(item)), el('time', '', formatTime(item.at))));
+      }
+      recent.append(list); root.append(recent); return root;
+    }
+    function autoReplyNumberField(label, name, value, min, max, hint = '') {
+      const wrap = el('label', 'field'); wrap.append(el('span', 'field-label', label)); const input = el('input', 'input'); input.type = 'number'; input.id = `auto-reply-${name}`; input.name = name; input.min = String(min); input.max = String(max); input.step = '1'; input.value = String(autoReplyCount(value, min)); wrap.append(input); if (hint) wrap.append(el('span', 'field-hint', hint)); return wrap;
+    }
+    function autoReplyPolicy(form = $('.auto-reply-policy')) {
+      // Without the rules form on screen (switching from the workbench), keep the saved rules.
+      const a = autoReplyState();
+      const read = (name, fallback) => { const value = Number(form?.elements?.namedItem(name)?.value); return Number.isFinite(value) && value > 0 ? value : fallback; };
+      const mode = form?.elements?.namedItem('group_mode')?.value || a.group_mode;
+      const waitRaw = form?.elements?.namedItem('wait_me_seconds')?.value, waitValue = Number(waitRaw);
+      const waitMe = waitRaw !== undefined && waitRaw !== '' && Number.isFinite(waitValue) ? Math.max(0, Math.min(180, Math.round(waitValue))) : (a.wait_me_seconds || 0);
+      return { group_mode: mode === 'all' ? 'all' : 'mention_only', debounce_seconds: read('debounce_seconds', a.debounce_seconds || 4), cooldown_seconds: read('cooldown_seconds', a.cooldown_seconds ?? 45), hourly_limit: read('hourly_limit', a.hourly_limit || 8), daily_limit: read('daily_limit', a.daily_limit || 40), wait_me_seconds: waitMe };
+    }
+    async function removeFromAllowlist(sessionId) {
+      const a = autoReplyState(), wasRunning = a.enabled && !a.paused;
+      const next = (a.allowlist || []).filter(entry => entry.session_id !== sessionId);
+      await rpc('configure_auto_reply', { allowlist: next, ...autoReplyPolicy() });
+      // Saving the list switches sending off; narrowing an already-confirmed list keeps the rest running.
+      if (wasRunning && next.length) await rpc('start_auto_reply', { acknowledge_send: true, remember: a.resume !== false });
+      await sync();
+    }
+    function sessionAutoReply(session) {
+      const state = getState();
+      if (!session || state.capabilities?.send === false || !['wechat_db', 'weflow', 'ocr'].includes(session.source)) return null;
+      if (session.source === 'ocr' && !session.active) return null;
+      const a = autoReplyState(), listed = (a.allowlist || []).some(entry => entry.session_id === session.id);
+      const on = listed && a.enabled && !a.paused && a.status !== 'emergency';
+      const b = el('button', `session-auto${on ? ' on' : ''}`); b.type = 'button'; b.setAttribute('role', 'switch'); b.setAttribute('aria-checked', String(on));
+      append(b, el('span', 'switch-knob'), el('span', '', '自动回复'));
+      b.title = on ? `正在自动回复「${session.title}」，点击关闭` : listed && a.enabled ? '自动回复已暂停，点击继续' : `让 ChatBot 自动回复「${session.title}」`;
+      b.disabled = !available();
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        try {
+          if (on) { await removeFromAllowlist(session.id); toast(`已关闭「${session.title}」的自动回复`); }
+          else await confirmSessionAutoReply(session, listed);
+        } catch (err) { toast(errorText(err), 'error'); }
+        finally { b.disabled = !available(); }
+      });
+      return b;
+    }
+    async function confirmSessionAutoReply(session, listed) {
+      const a = autoReplyState();
+      let allowlist = a.allowlist || [];
+      if (!listed) {
+        const id = String(session.id), knownGroup = Boolean(session.is_group || session.type === 'group' || id.endsWith('@chatroom'));
+        const entry = { session_id: id, title: session.title, is_group: knownGroup, source: session.source, auto_reply_type_known: session.source !== 'ocr' || Boolean(session.type), type: session.type || (session.source !== 'ocr' ? (knownGroup ? 'group' : 'private') : undefined) };
+        const typed = await confirmAutoReplyTypes([entry]); if (!typed) return;
+        allowlist = [...allowlist.filter(item => item.source === session.source), ...typed];
+      }
+      const group = Boolean(session.is_group || session.type === 'group' || String(session.id).endsWith('@chatroom'));
+      const dialog = $('#editor'); dialog.replaceChildren(); dialog.className = 'dialog auto-reply-confirm';
+      const copy = append(el('div', 'auto-reply-confirm-copy'), el('div', 'eyebrow', demo ? '合成演示' : '开启前确认'), el('h2', '', `让 ChatBot 自动回复「${session.title}」？`),
+        el('p', '', demo ? '演示模式只会更新合成状态，不会连接微信或发送消息。' : `对方发来新消息时，ChatBot 会判断要不要回，需要时以你的身份直接发送。${group ? '群聊里只回复明确 @你 的消息。' : ''}每小时最多 ${a.hourly_limit || 8} 条，随时可在右上角暂停。`));
+      const check = el('input'); check.type = 'checkbox'; check.id = 'session-auto-confirm';
+      const remember = el('input'); remember.type = 'checkbox'; remember.id = 'session-auto-remember'; remember.checked = a.resume !== false;
+      const checks = append(el('div', 'auto-reply-confirm-checks'), append(el('label', 'auto-reply-confirm-check'), check, el('span', '', demo ? '我了解这是合成演示。' : '我了解 ChatBot 会通过微信直接发送消息。')),
+        append(el('label', 'auto-reply-confirm-check'), remember, el('span', '', '电脑重启或 ChatBot 重新打开后，自动恢复')));
+      const start = button('开启自动回复', 'play', async () => {
+        if (!check.checked) return;
+        await rpc('configure_auto_reply', { allowlist, ...autoReplyPolicy() });
+        await rpc('start_auto_reply', { acknowledge_send: true, remember: remember.checked });
+        dialog.close(); await sync(); toast(demo ? '演示模式：仅更新合成状态，没有发送消息' : `已开启「${session.title}」的自动回复`);
+      }, 'primary', true);
+      check.addEventListener('change', () => { start.disabled = !check.checked; });
+      dialog.append(copy, checks, append(el('div', 'dialog-footer'), button('取消', null, () => dialog.close()), start)); dialog.showModal();
+    }
+    function confirmAutoReplyStart() {
+      const dialog = $('#editor'); dialog.replaceChildren(); dialog.className = 'dialog auto-reply-confirm';
+      const copy = append(el('div', 'auto-reply-confirm-copy'), el('span', 'auto-reply-confirm-symbol', '↗'), el('div', 'eyebrow', demo ? '合成演示' : '发送前确认'), el('h2', '', demo ? '模拟启动自动回复' : 'ChatBot 将代表你发送微信消息'), el('p', '', demo ? '演示模式只会更新合成状态，不会连接微信或发送消息。' : `当前名单包含 ${autoReplyState().allowlist?.length || 0} 个会话。收到新消息后，ChatBot 可能会自动生成并发送回复。`));
+      const checks = el('div', 'auto-reply-confirm-checks');
+      const check = el('input'); check.type = 'checkbox'; check.id = 'auto-reply-confirm-check';
+      const remember = el('input'); remember.type = 'checkbox'; remember.id = 'auto-reply-remember'; remember.checked = autoReplyState().resume !== false;
+      checks.append(append(el('label', 'auto-reply-confirm-check'), check, el('span', '', demo ? '我已了解这是合成演示，不会向微信发送消息。' : '我已检查允许回复的会话、群聊规则和发送限额；我确认 ChatBot 可以通过微信发送消息。')),
+        append(el('label', 'auto-reply-confirm-check'), remember, el('span', '', '电脑重启或 ChatBot 重新打开后，自动恢复')));
+      const actions = append(el('div', 'dialog-footer'), button('返回检查', null, () => dialog.close()), button(demo ? '模拟启动' : '确认并启动', 'play', async () => { if (!check.checked) return; const form = $('.auto-reply-policy'); if (form && !form.reportValidity()) return; await rpc('configure_auto_reply', { allowlist: autoReplyState().allowlist || [], ...autoReplyPolicy(form) }); await rpc('start_auto_reply', { acknowledge_send: true, remember: remember.checked }); dialog.close(); await sync(); toast(demo ? '演示模式：仅更新合成状态，没有发送消息' : '自动回复已启动'); }, 'primary', true));
+      check.addEventListener('change', () => { const start = actions.querySelector('.btn.primary'); if (start) start.disabled = !check.checked; });
+      dialog.append(copy, checks, actions); dialog.showModal();
+    }
+    function confirmAutoReplyTypes(selected) {
+      const entries = selected.map(item => ({ ...item })), unknown = entries.filter(item => !item.auto_reply_type_known && !item.type);
+      if (!unknown.length) return Promise.resolve(entries.map(item => ({ session_id: item.session_id, title: item.title, is_group: item.type === 'group', type: item.type || (item.is_group ? 'group' : 'private') })));
+      return new Promise(resolve => {
+        const dialog = $('#editor'); dialog.replaceChildren(); dialog.className = 'dialog auto-reply-confirm';
+        const single = unknown.length === 1, copy = append(el('div', 'auto-reply-confirm-copy'), el('div', 'eyebrow', '会话类型'), el('h2', '', single ? `「${unknown[0].title}」是单聊还是群聊？` : '确认这些会话是单聊还是群聊'), el('p', '', '屏幕识别分不清单聊和群聊，请选一下；群聊只会回复 @你 的消息。'));
+        const form = el('div', 'auto-reply-type-list');
+        for (const item of unknown) {
+          const row = el('label', 'field'); row.append(el('span', 'field-label', item.title));
+          const select = el('select', 'input'); select.dataset.sessionId = item.session_id; select.append(new Option('请选择会话类型', ''), new Option('单聊联系人', 'private'), new Option('群聊', 'group')); row.append(select); form.append(row);
+        }
+        const cancel = button(single ? '取消' : '返回名单', null, () => { dialog.close(); resolve(null); });
+        const save = button('下一步', 'check', () => {
+          for (const select of form.querySelectorAll('select')) { if (!select.value) return; const item = entries.find(entry => entry.session_id === select.dataset.sessionId); item.type = select.value; item.is_group = select.value === 'group'; }
+          dialog.close(); resolve(entries.map(item => ({ session_id: item.session_id, title: item.title, is_group: item.type === 'group', type: item.type || (item.is_group ? 'group' : 'private') })));
+        }, 'primary');
+        form.addEventListener('change', () => { save.disabled = [...form.querySelectorAll('select')].some(select => !select.value); }); save.disabled = true;
+        dialog.append(copy, form, append(el('div', 'dialog-footer'), cancel, save)); dialog.addEventListener('close', () => resolve(null), { once: true }); dialog.showModal();
+      });
+    }
+    function emergencyStop() {
+      const dialog = $('#editor'); dialog.replaceChildren(); dialog.className = 'dialog auto-reply-confirm';
+      dialog.append(append(el('div', 'auto-reply-confirm-copy'), el('div', 'eyebrow', '紧急控制'), el('h2', '', '立即停止自动回复？'), el('p', '', 'ChatBot 会停止后续发送，并清除尚未处理的自动回复任务。')),
+        append(el('div', 'dialog-footer'), button('继续运行', null, () => dialog.close()), button('紧急停止', 'close', async () => { await rpc('stop_auto_reply', { emergency: true }); dialog.close(); await sync(); toast('自动回复已紧急停止'); }, 'danger'))); dialog.showModal();
+    }
+
+    function historyControl(session) {
+      if (session.context_window?.complete && session.context_window.source === 'wechat_db') return el('div', 'history-caption', session.context_window.mode === 'latest' ? `最近 ${session.context_window.message_count} 条（近 7 天只有 ${session.context_window.week_count} 条）` : '最近 7 天');
+      if (['ocr', 'manual'].includes(session.source)) return el('div', 'history-caption', session.source === 'manual' ? '手动粘贴的对话' : '只显示微信窗口里可见的消息');
+      const data = histories.get(session.id) || { cursor: session.next_cursor ?? null, more: session.has_more !== false, busy: false };
+      if (!data.more) return el('div', 'history-caption', '已到最早的记录');
+      return append(el('div', 'history-control'), button(data.busy ? '正在加载历史…' : '加载更早消息', 'clock', async () => {
+        data.busy = true; histories.set(session.id, data);
+        try {
+          const result = await rpc('load_session_messages', { session_id: session.id, cursor: data.cursor, limit: 30 });
+          data.cursor = result.next_cursor ?? null; data.more = Boolean(result.has_more && data.cursor !== null);
+          if (result.available === false) toast(result.message || '当前来源没有提供历史消息。');
+          await sync();
+          const current = getState().current_session, older = result.messages || result.items || [];
+          if (older.length) {
+            const unique = new Map(); [...older, ...(data.messages || []), ...(session.messages || []), ...(current?.id === session.id ? current.messages || [] : [])].forEach(m => { if (m.id !== undefined && m.id !== null) unique.set(m.id, m); });
+            data.messages = [...unique.values()];
+            if (current?.id === session.id) setState({ current_session: { ...current, messages: data.messages, next_cursor: data.cursor, has_more: data.more } });
+          }
+        } finally { data.busy = false; render(); }
+      }, 'small ghost', data.busy));
+    }
+    function reconcileSnapshot(snapshot) {
+      if (snapshot.current_session === null && Array.isArray(snapshot.sessions) && snapshot.sessions.length === 0) histories.clear();
+      const current = snapshot.current_session, loaded = current ? histories.get(current.id) : null;
+      if (!current || !loaded?.messages?.length || ['ocr', 'manual'].includes(current.source)) return snapshot;
+      const merged = new Map();
+      [...loaded.messages, ...(current.messages || [])].forEach(message => { if (message.id !== undefined && message.id !== null) merged.set(message.id, message); });
+      loaded.messages = [...merged.values()];
+      return { ...snapshot, current_session: { ...current, messages: loaded.messages, next_cursor: loaded.cursor, has_more: loaded.more } };
+    }
+    // 表情：图按需从桌面端取一次并缓存（不进快照），下面写一句模型识别出的意思。
+    const stickerImages = new Map(), stickerLoading = new Set();
+    function stickerContent(message, session) {
+      const root = el('div', 'message-bubble sticker-message'), key = message.emoji_md5 || message.id;
+      const cached = stickerImages.get(key);
+      if (cached) { const image = el('img', 'sticker-image'); image.src = cached; image.alt = message.image_description ? `表情：${message.image_description}` : '表情'; root.append(image); }
+      else if (cached !== null) {
+        root.append(el('div', 'sticker-placeholder', '表情'));
+        if (!stickerLoading.has(key) && available() && !demo) {
+          stickerLoading.add(key);
+          rpc('load_media', { session_id: session.id, message_id: message.id }).then(result => {
+            const url = result?.data_url || '';
+            stickerImages.set(key, /^data:image\/(png|jpeg|gif|webp);base64,/i.test(url) ? url : null);
+            render(true);
+          }).catch(() => stickerImages.set(key, null)).finally(() => stickerLoading.delete(key));
+        }
+      }
+      const note = message.image_description;
+      if (note) root.append(el('p', 'sticker-note', note));
+      else root.append(button('看看是什么意思', 'spark', async b => {
+        b.querySelector('span').textContent = '正在识别…';
+        const result = await rpc('analyze_image', { session_id: session.id, message_id: message.id });
+        if (result.available === false || result.success === false) { toast(result.message || '这个表情暂时识别不了。', 'error'); return; }
+        await sync();
+      }, 'small ghost', !available()));
+      return root;
+    }
+    function messageContent(message, session) {
+      const kind = messageKind(message);
+      if (kind === 'text') return el('div', 'message-bubble', message.text || '');
+      if (kind === 'emoji') return stickerContent(message, session);
+      const root = el('div', `message-bubble media-message ${kind}-message`);
+      root.append(append(el('div', 'media-label'), icon(kind, 15), el('span', '', kind === 'voice' ? '语音消息' : '图片消息'), kind === 'voice' && message.duration ? el('span', 'voice-duration', `${message.duration}″`) : null));
+      if (kind === 'image') {
+        const source = safeMedia(message.media_url);
+        if (source) { const image = el('img', 'message-image'); image.src = source; image.alt = '会话中的图片'; image.loading = 'lazy'; image.addEventListener('error', () => { image.replaceWith(el('div', 'media-unavailable', '图片暂时无法显示')); }); root.append(image); }
+        else root.append(append(el('div', 'media-unavailable'), icon('image', 27), el('span', '', '当前来源仅识别到图片标记')));
+      } else { const wave = el('div', 'voice-wave'); wave.setAttribute('aria-hidden', 'true'); for (let i = 0; i < 24; i++) wave.append(el('i', `wave-${i % 5}`)); root.append(wave); }
+      const existing = kind === 'voice' ? message.transcript : message.image_description;
+      if (existing) root.append(el('p', 'media-description', existing));
+      const mediaTools = el('div', 'media-tools'); root.append(mediaTools);
+      mediaTools.append(button(kind === 'voice' ? '播放' : '查看原图', kind === 'voice' ? 'play' : 'image', async () => {
+        const result = await rpc('load_media', { session_id: session.id, message_id: message.id, asset_id: message.asset_id || null });
+        if (result.available === false || result.success === false) { toast(result.message || result.reason || '当前数据源未提供媒体文件。', 'error'); return; }
+        const url = result.media_url || result.data_url || result.url || result.asset?.data_url || result.asset?.media_url || '';
+        if (kind === 'image') {
+          const source = safeMedia(url); if (!source) throw new Error('图片未提供可在本地展示的地址。');
+          const image = el('img', 'message-image'); image.src = source; image.alt = '会话中的图片'; image.addEventListener('error', () => image.replaceWith(el('div', 'media-unavailable', '图片格式无法预览，可尝试模型识图。')));
+          const previous = $('.message-image, .media-unavailable', root); if (previous) previous.replaceWith(image); else root.append(image);
+        } else {
+          const safe = url.length <= 20 * 1024 * 1024 && (/^data:audio\/(mpeg|mp3|wav|x-wav|ogg|webm|mp4|x-m4a|flac|x-flac|opus|aac);base64,[a-z0-9+/=\s]+$/i.test(url) || (location.protocol === 'file:' && /^file:\/\//i.test(url)));
+          if (!safe) throw new Error('音频未提供可在本地播放的地址。');
+          let audio = $('audio', root); if (!audio) { audio = el('audio', 'message-audio'); audio.controls = true; audio.preload = 'metadata'; audio.setAttribute('aria-label', '语音消息播放器'); audio.addEventListener('error', () => { if (!$('.audio-format-note', root)) root.append(el('p', 'media-note audio-format-note', '此音频格式暂时无法播放，仍可尝试转写。')); }); root.append(audio); } audio.src = url;
+        }
+      }, 'small ghost', !available()));
+      mediaTools.append(button(kind === 'voice' ? (existing ? '重新转写' : '转成文字') : (existing ? '重新识图' : '识别图片'), kind === 'voice' ? 'voice' : 'spark', async b => {
+        b.querySelector('span').textContent = kind === 'voice' ? '正在转写…' : '正在识图…';
+        try {
+          const result = await rpc(kind === 'voice' ? 'transcribe_voice' : 'analyze_image', { session_id: session.id, message_id: message.id });
+          if (result.available === false || result.success === false) { toast(result.message || result.reason || '当前数据源或模型尚未支持此项能力。', 'error'); return; }
+          await sync();
+          const text = kind === 'voice' ? result.transcript || result.text : result.description || result.image_description || result.text;
+          if (text && getState().current_session?.id === session.id) { const current = getState().current_session; setState({ current_session: { ...current, messages: current.messages.map(m => m.id === message.id ? { ...m, [kind === 'voice' ? 'transcript' : 'image_description']: text } : m) } }); }
+          if (result.message) toast(result.message);
+        } finally { if (b.isConnected) b.querySelector('span').textContent = kind === 'voice' ? '转成文字' : '识别图片'; }
+      }, 'small ghost', !available()));
+      return root;
+    }
+    async function chooseMedia(session, kind) {
+      if (!session?.id) throw new Error('请先选择会话，或手动加入一段对话。');
+      const result = await rpc('choose_media', { session_id: session.id, kind });
+      if (result.cancelled) return;
+      if (result.success === false || result.available === false) throw new Error(result.message || '媒体文件没有成功加入。');
+      await sync(); if (result.message) toast(result.message);
+    }
+
+    async function saveAppearance(changes) {
+      const current = getState().appearance || appearance;
+      const result = await rpc('set_appearance', { font_scale: current.font_scale || appearance.font_scale, theme: current.theme || appearance.theme, ...changes });
+      if (result.appearance) setState({ appearance: result.appearance }); else await sync();
+      toast('外观已更新');
+    }
+    function renderAppearance() {
+      const root = el('section', 'page appearance-page');
+      const themes = el('section', 'appearance-section'); themes.append(el('h3', 'settings-group-title', '配色'));
+      const choices = el('div', 'theme-choices');
+      for (const [theme, label, desc] of [['paper', '日纸', '暖纸 · 墨与朱砂'], ['aurora', '素笺', '淡纸 · 更多留白'], ['night', '夜纸', '深色 · 夜里不刺眼']]) {
+        const b = el('button', `theme-choice theme-${theme}${appearance.theme === theme ? ' selected' : ''}`); b.type = 'button'; b.setAttribute('aria-pressed', String(appearance.theme === theme));
+        const miniature = el('span', 'theme-miniature'); for (let i = 0; i < 4; i++) miniature.append(el('i'));
+        append(b, miniature, append(el('span', 'theme-choice-copy'), el('b', '', label), el('span', '', desc)));
+        b.addEventListener('click', () => saveAppearance({ theme }).catch(err => toast(errorText(err), 'error'))); choices.append(b);
+      }
+      themes.append(choices); root.append(themes);
+      const reading = el('section', 'appearance-section'); reading.append(el('h3', 'settings-group-title', '字号'));
+      const sizes = el('div', 'font-size-choices');
+      for (const [scale, label] of [[.9, '小'], [1, '标准'], [1.1, '大'], [1.2, '更大'], [1.3, '特大']]) sizes.append(button(label, null, () => saveAppearance({ font_scale: scale }), `size-option${Math.abs(appearance.font_scale - scale) < .01 ? ' selected' : ''}`));
+      reading.append(sizes); root.append(reading);
+      const background = el('section', 'appearance-section'); background.append(el('h3', 'settings-group-title', '背景图'));
+      background.append(append(el('div', 'background-actions'), button(appearance.background_url ? '更换背景' : '选择图片', 'image', async () => { const result = await rpc('choose_background'); if (result.appearance) setState({ appearance: result.appearance }); else await sync(); if (demo) toast('演示模式使用内置合成背景。'); }, 'small', !available()), appearance.background_url ? button('去掉背景', 'close', async () => { const result = await rpc('clear_background'); if (result.appearance) setState({ appearance: result.appearance }); else await sync(); }, 'small ghost', !available()) : null));
+      if (appearance.background_url) {
+        background.append(field('遮罩强度', 'background-dim', appearance.background_dim ?? .7, { type: 'range' }));
+        const dim = $('#background-dim', background); dim.min = '.3'; dim.max = '.9'; dim.step = '.1'; dim.addEventListener('change', () => saveAppearance({ background_dim: Number(dim.value) }).catch(err => toast(errorText(err), 'error')));
+      }
+      root.append(background);
+      const motion = el('section', 'appearance-section'); motion.append(el('h3', 'settings-group-title', '动效'));
+      for (const [key, label] of [['motion', '界面动效'], ['intro_enabled', '启动时播放开场']]) {
+        const row = append(el('label', 'switch-row'), append(el('div', 'switch-copy'), el('div', '', label)));
+        const sw = el('span', 'switch'), input = document.createElement('input'); input.type = 'checkbox'; input.checked = appearance[key] !== false; input.setAttribute('aria-label', label);
+        input.addEventListener('change', () => saveAppearance({ [key]: input.checked }).catch(err => toast(errorText(err), 'error')));
+        append(sw, input, el('span', 'switch-track')); row.append(sw); motion.append(row);
+      }
+      motion.append(button('重播开场', 'play', () => startIntro(true), 'small ghost'));
+      root.append(motion);
+      return root;
+    }
+    async function loadMoments(reset = false) {
+      if (moments.busy && !reset) return;
+      const serial = ++moments.serial; moments.busy = true; moments.error = '';
+      if (reset) { moments.items = []; moments.cursor = null; }
+      if (getPage() === 'moments') render();
+      try {
+        const result = await rpc('list_moments', { cursor: reset ? null : moments.cursor, limit: 10, session_id: moments.friend?.id || null });
+        if (serial !== moments.serial) return;
+        moments.available = result.available !== false; moments.source = result.source || ''; moments.detail = result.warning || result.message || result.detail || '';
+        const ids = new Set(moments.items.map(m => m.id));
+        for (const item of result.items || []) if (item.id && !ids.has(item.id)) { moments.items.push(item); ids.add(item.id); }
+        moments.cursor = result.next_cursor ?? null; moments.more = Boolean(result.has_more && moments.cursor !== null);
+      } catch (err) { if (serial === moments.serial) { moments.error = errorText(err); moments.available = false; } }
+      finally { if (serial === moments.serial) { moments.loaded = true; moments.busy = false; if (getPage() === 'moments') render(); } }
+    }
+    function renderMoments() {
+      const root = el('section', 'page moments-page');
+      const imports = el('div', 'page-heading-actions');
+      imports.append(button('导入朋友圈 JSON', 'upload', () => api.importMoments(async () => { moments.loaded = false; await loadMoments(true); }), 'small', !available() || demo || moments.busy));
+      if (getState().capabilities?.native_database) imports.append(button('索引本机朋友圈文字', 'folder', async () => {
+        let cursor = null, total = 0, unreadable = 0;
+        moments.busy = true; moments.error = ''; render();
+        try {
+          let batch;
+          do { batch = await rpc('sync_native_moments', { cursor }); cursor = batch.next_cursor; total += batch.indexed; unreadable += batch.unreadable || 0; } while (batch.has_more);
+          toast(`已处理 ${total} 条朋友圈文字，${unreadable} 条无法解析。`);
+        } finally { moments.busy = false; moments.loaded = false; await loadMoments(true); }
+      }, 'small', moments.busy));
+      root.append(imports);
+      root.append(heading('朋友圈', '在回应近况之前，先斟酌关系与分寸。', 'SOCIAL CONTEXT', [button('手动补充', 'pen', manualMomentDialog, '', !available()), button('刷新动态', 'refresh', () => loadMoments(true), 'subtle', moments.busy || !available())]));
+      const grid = el('div', 'moments-layout'), sidebar = el('aside', 'moments-sidebar');
+      sidebar.append(append(el('div', 'moment-friend-avatar'), moments.friend ? el('span', '', displayName(moments.friend).slice(0, 1)) : icon('moments', 29)), el('h2', '', moments.friend ? displayName(moments.friend) : '全部动态'), el('p', '', moments.friend ? '仅查看这位好友的可用动态' : '选择一位好友，查看适合怎样互动。'), button('选择好友', 'people', () => openCatalog(async item => { moments.friend = item; moments.loaded = false; await loadMoments(true); }), '', !available()));
+      if (moments.friend) sidebar.append(button('显示全部', 'arrow', () => { moments.friend = null; return loadMoments(true); }, 'small ghost'));
+      sidebar.append(append(el('div', 'moments-principle'), icon('lock', 14), el('p', '', '这里只提供点赞与评论建议，不会替你点赞或发送评论。')));
+      const feed = el('div', 'moments-feed');
+      if (moments.error) feed.append(notice(moments.error, 'error'));
+      if (moments.loaded && (!moments.available || moments.detail)) feed.append(notice(moments.detail || '当前数据源尚未提供朋友圈。窗口 OCR 只读取可见聊天，无法获取全量好友动态。你可以手动补充一条。', 'info'));
+      if (moments.busy && !moments.items.length) feed.append(append(el('div', 'panel moment-loading'), el('div', 'skeleton short'), el('div', 'skeleton wide'), el('div', 'skeleton medium')));
+      else if (!moments.items.length) feed.append(append(el('div', 'panel'), empty('等待一条近况', moments.friend ? '这位好友没有可用动态。可以切换好友或手动补充。' : '连接支持朋友圈的数据源，或粘贴一条好友动态，获取互动建议。', 'moments', button('手动补充动态', 'plus', manualMomentDialog, 'small', !available()))));
+      for (const item of moments.items) feed.append(momentCard(item));
+      if (moments.more) feed.append(button(moments.busy ? '加载中…' : '加载更多动态', 'chevron', () => loadMoments(false), '', moments.busy));
+      append(grid, sidebar, feed); root.append(grid);
+      if (!moments.loaded && !moments.busy) queueMicrotask(() => loadMoments(true));
+      return root;
+    }
+    function momentCard(item) {
+      const author = typeof item.author === 'object' ? item.author.name || item.author.title || '好友' : item.author || item.author_name || item.name || '好友';
+      const card = el('article', 'panel moment-card');
+      const identity = append(el('div', 'session-identity'), el('div', 'avatar', String(author).slice(0, 1)), append(el('div'), el('h3', '', author), el('span', 'timestamp', formatTime(item.timestamp || item.updated))));
+      card.append(append(el('div', 'moment-top'), identity), el('p', 'moment-text', item.text || item.content || '这条动态没有文字。'));
+      const media = Array.isArray(item.media) ? item.media : [];
+      if (media.length) {
+        const gallery = el('div', 'moment-gallery');
+        for (const [index, asset] of media.slice(0, 9).entries()) gallery.append(momentMediaTile(item, asset, index));
+        card.append(gallery);
+        if (media.length > 9) card.append(el('p', 'field-hint', `此动态共有 ${media.length} 个附件，当前展示前 9 个。`));
+      } else {
+        const images = Array.isArray(item.images) ? item.images : Array.isArray(item.media_urls) ? item.media_urls : [];
+        if (images.length) { const gallery = el('div', 'moment-gallery'); for (const image of images.slice(0, 9)) { const source = safeMedia(typeof image === 'string' ? image : image.url || image.media_url); if (source) { const img = el('img'); img.src = source; img.alt = '朋友圈配图'; img.loading = 'lazy'; gallery.append(img); } else gallery.append(append(el('div', 'moment-image-placeholder'), icon('image', 24), el('span', '', '图片地址不可在本地直接预览'))); } card.append(gallery); }
+      }
+      const running = moments.running.has(item.id), result = moments.results.get(item.id);
+      card.append(append(el('div', 'moment-actions'), el('span', 'subtle-caption', item.source === 'manual' ? '手动提供的动态' : moments.source === 'demo' ? '合成演示动态' : '来自可用数据源'), button(running ? '正在斟酌…' : result ? '重新分析' : '分析这条动态', 'spark', async () => {
+        moments.running.add(item.id); render();
+        try { const value = await rpc('analyze_moment', { moment_id: item.id, session_id: item.session_id || moments.friend?.id || null }); if (value.available === false) throw new Error(value.message || '当前模型暂不支持朋友圈建议。'); moments.results.set(item.id, value); }
+        finally { moments.running.delete(item.id); if (getPage() === 'moments') render(); }
+      }, running ? '' : 'subtle', running || !available())));
+      if (running) card.append(append(el('div', 'moment-advice'), el('div', 'skeleton wide'), el('div', 'skeleton medium')));
+      else if (result) {
+        const advice = el('section', 'moment-advice');
+        advice.append(append(el('div', 'moment-advice-heading'), icon('heart', 16), el('h3', '', typeof result.like === 'boolean' ? (result.like ? '可以点个赞' : '暂时不点赞也合适') : '互动建议')));
+        if (result.recommendation) advice.append(el('p', 'moment-recommendation', valueText(result.recommendation, '')));
+        if (result.reason) advice.append(el('p', 'moment-reason', result.reason));
+        const mediaWarning = result.warning || result.warnings;
+        if (mediaWarning) advice.append(notice(Array.isArray(mediaWarning) ? mediaWarning.join('；') : valueText(mediaWarning, ''), 'info'));
+        for (const comment of Array.isArray(result.comments) ? result.comments : []) { const text = typeof comment === 'string' ? comment : comment.text || comment.comment || ''; if (text) advice.append(append(el('div', 'comment-suggestion'), el('p', '', text), button('复制', 'copy', () => api.action('copy_reply', { text }, '已复制评论建议，请自行确认发送'), 'small ghost'))); }
+        card.append(advice);
+      }
+      return card;
+    }
+    function momentMediaTile(post, asset, index) {
+      const key = `${post.id}:${asset.id || index}`;
+      const state = momentMedia.get(key) || { source: '', busy: false, error: '' };
+      momentMedia.set(key, state);
+      const tile = el('div', 'moment-media-tile'); tile.dataset.assetId = String(asset.id || '');
+      const kind = String(asset.kind || 'image');
+      const label = kind === 'image' ? `配图 ${index + 1}` : kind === 'voice' || kind === 'audio' ? '音频附件' : kind === 'video' ? '视频附件' : '媒体附件';
+      const paint = () => {
+        tile.replaceChildren();
+        if (state.source) {
+          const image = el('img', 'moment-loaded-image'); image.src = state.source; image.alt = `朋友圈${label}`;
+          image.addEventListener('error', () => { state.source = ''; state.error = '图片已获取，但当前格式无法显示。'; paint(); });
+          tile.append(image, el('span', 'moment-media-loaded-label', label)); return;
+        }
+        tile.append(append(el('div', 'moment-media-symbol'), icon(kind === 'voice' || kind === 'audio' ? 'voice' : 'image', 23)), el('span', 'moment-media-label', label));
+        const unavailable = ['unavailable', 'missing', 'unsupported', 'remote_only'].includes(String(asset.status || ''));
+        const explanation = state.error || asset.reason || (kind === 'image' ? unavailable ? '数据源未提供可读取的本地配图' : '配图尚未加载' : '此附件暂不支持图片预览');
+        tile.append(el('p', `moment-media-reason${state.error ? ' media-load-error' : ''}`, explanation));
+        if (kind === 'image' && asset.id) tile.append(button(state.busy ? '正在加载…' : state.error ? '重试加载配图' : '加载配图', 'image', async () => {
+          state.busy = true; state.error = ''; paint();
+          try {
+            const result = await rpc('load_media', { asset_id: asset.id });
+            if (result.available === false || result.success === false) { state.error = result.message || result.reason || '上游没有提供可读取的配图。'; return; }
+            const source = safeMedia(result.data_url || result.media_url || result.url || '');
+            if (!source) { state.error = result.message || '没有返回可在本地展示的图片，不会自动抓取外链。'; return; }
+            state.source = source;
+          } catch (err) { state.error = errorText(err); }
+          finally { state.busy = false; if (tile.isConnected) paint(); else if (getPage() === 'moments') render(); }
+        }, 'small ghost', state.busy || !available()));
+        else if (!asset.id && kind === 'image') tile.append(el('span', 'field-hint', '此配图尚未登记可加载的媒体资产。'));
+      };
+      paint(); return tile;
+    }
+    function manualMomentDialog() {
+      const { dialog, body } = showDialog('手动补充朋友圈动态');
+      const form = el('form');
+      append(form, el('p', 'dialog-copy', '只分析你主动提供的内容。无需访问微信朋友圈，也不会代你进行互动。'), field('好友名称', 'moment-author', moments.friend ? displayName(moments.friend) : '', { placeholder: '这条动态来自谁' }), field('动态内容', 'moment-text', '', { rows: 7, placeholder: '粘贴好友的动态文字，也可以补充图片中可见的内容。' }));
+      const feedback = el('div', 'moment-form-feedback');
+      const save = button('加入动态列表', 'plus', async () => {
+        const author = $('#moment-author').value.trim(), text = $('#moment-text').value.trim();
+        if (!author || !text) { feedback.replaceChildren(notice('请填写好友名称和动态内容。', 'error')); return; }
+        const result = await rpc('manual_moment', { author, text, session_id: moments.friend?.id || null });
+        if (result.available === false) throw new Error(result.message || '暂时无法导入动态。');
+        dialog.close(); moments.loaded = false; await loadMoments(true); go('moments'); toast('动态已加入，点击分析即可获取建议。');
+      }, 'primary');
+      append(form, feedback, append(el('div', 'dialog-footer'), button('取消', null, () => dialog.close()), save)); form.addEventListener('submit', event => { event.preventDefault(); save.click(); }); body.append(form);
+    }
+
+    $('#session-catalog').addEventListener('close', () => { catalog.serial++; catalog.busy = false; clearTimeout(searchTimer); });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') dismissIntro();
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); dismissIntro(); openCatalog(); }
+    });
+    document.addEventListener('pointerdown', event => {
+      const target = event.target.closest('button');
+      if (target && !target.disabled && !matchMedia('(prefers-reduced-motion: reduce)').matches) { target.classList.remove('interaction-pulse'); void target.offsetWidth; target.classList.add('interaction-pulse'); setTimeout(() => target.classList.remove('interaction-pulse'), 450); }
+    });
+    updateState(getState());
+    return { updateState, reconcileSnapshot, renderAppearance, renderMoments, renderAutoReply, renderAgent, handleWorkProgress, openCatalog, messageContent, historyControl, chooseMedia, startIntro, sessionAutoReply };
+  }
+});
