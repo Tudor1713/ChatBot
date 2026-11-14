@@ -30,7 +30,7 @@ jobs:
           - os: windows-latest
             platform: Windows
             python: .venv/Scripts/python.exe
-          - os: macos-14
+          - os: macos-latest
             platform: macOS
             python: .venv/bin/python
     runs-on: ${{ matrix.os }}

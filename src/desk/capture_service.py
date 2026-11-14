@@ -289,6 +289,9 @@ class CaptureService:
                 self._config = next_config
                 self._config_revision += 1
                 self._control_epoch += 1
+                if next_config.get('source') == 'archive':
+                    self._wanted.clear()
+                    self._once.clear()
                 self._restart.set()
                 self._wake.set()
 
