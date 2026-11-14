@@ -85,7 +85,7 @@ def main():
         view.load(QUrl.fromLocalFile(str(ROOT / 'ui/index.html')))
         view.show()
         wait("document.querySelectorAll('.message').length > 0")
-        QTest.qWait(150)
+        wait("lateImage.complete && lateImage.naturalWidth > 0 && (()=>{const t=document.querySelector('.timeline');return t.scrollHeight-t.scrollTop-t.clientHeight<45})()")
         check('page_identity', js('document.title') == 'ChatBot')
         report['initial_message_nodes'] = js("document.querySelectorAll('.message').length")
         check('bounded_initial_render_200_of_1000', report['initial_message_nodes'] == 200)

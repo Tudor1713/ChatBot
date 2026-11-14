@@ -30,13 +30,18 @@ jobs:
           - os: windows-latest
             platform: Windows
             python: .venv/Scripts/python.exe
+            qt_platform: offscreen
+            chromium_flags: ''
           - os: macos-latest
             platform: macOS
             python: .venv/bin/python
+            qt_platform: cocoa
+            chromium_flags: --disable-gpu
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     env:
-      QT_QPA_PLATFORM: offscreen
+      QT_QPA_PLATFORM: ${{ matrix.qt_platform }}
+      QTWEBENGINE_CHROMIUM_FLAGS: ${{ matrix.chromium_flags }}
       PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
